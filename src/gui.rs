@@ -40,6 +40,11 @@ struct Settings {
     light: bool,
     custom_pool: String,
     start_on_open: bool,
+    /// "mh" = Miners Haven pools, "other" = any other RandomX pool
+    pool_mode: String,
+    other_pool: String,
+    other_user: String,
+    other_pass: String,
 }
 
 impl Default for Settings {
@@ -55,6 +60,10 @@ impl Default for Settings {
             light: false,
             custom_pool: String::new(),
             start_on_open: false,
+            pool_mode: "mh".into(),
+            other_pool: String::new(),
+            other_user: String::new(),
+            other_pass: String::new(),
         }
     }
 }
@@ -73,7 +82,20 @@ fn settings_path() -> std::path::PathBuf {
 
 impl Settings {
     fn load() -> Settings {
-        std::fs::read_to_string(settings_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+        let mut s: Settings =
+            std::fs::read_to_string(settings_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+        // the old "custom pool" box became the "Other pool" option
+        if !s.custom_pool.trim().is_empty() && s.other_pool.is_empty() {
+            s.other_pool = std::mem::take(&mut s.custom_pool);
+            s.pool_mode = "other".into();
+        }
+        if s.pool_mode != "other" {
+            s.pool_mode = "mh".into();
+        }
+        s
+    }
+    fn other(&self) -> bool {
+        self.pool_mode == "other"
     }
     fn save(&self) {
         let p = settings_path();
@@ -149,21 +171,34 @@ impl App {
             self.error = Some(format!("Enter your {} wallet address first.", self.s.coin.to_uppercase()));
             return;
         }
-        if let Some(w) = wallet_warning(&self.s.coin, &wallet) {
-            self.error = Some(w);
-            return;
-        }
-        let pools: Vec<String> = if self.s.custom_pool.trim().is_empty() {
-            engine::default_pool(&self.s.coin, self.s.solo, self.s.large).into_iter().collect()
-        } else {
-            self.s.custom_pool.split([',', ' ']).filter(|p| !p.is_empty()).map(String::from).collect()
-        };
         let worker = self.s.worker.trim().replace(['.', ' '], "-");
-        let login = if worker.is_empty() { wallet } else { format!("{wallet}.{worker}") };
-        let cfg = Config { pools: pools.clone(), login, pass: "x".into(), threads: self.s.threads, light: self.s.light };
+        let (pools, login, pass): (Vec<String>, String, String) = if self.s.other() {
+            let pools: Vec<String> = self.s.other_pool.split([',', ' ']).filter(|p| !p.is_empty()).map(String::from).collect();
+            if pools.is_empty() {
+                self.error = Some("Enter the pool address (host:port), or pick one from the list.".into());
+                return;
+            }
+            if let Some(e) = pools.iter().find_map(|p| mhminer::stratum::parse_pool(p).err()) {
+                self.error = Some(e);
+                return;
+            }
+            let user = self.s.other_user.trim();
+            let login = if user.is_empty() { wallet } else { user.to_string() };
+            let pass = self.s.other_pass.trim();
+            let pass = if !pass.is_empty() { pass.to_string() } else if !worker.is_empty() { worker.clone() } else { "x".into() };
+            (pools, login, pass)
+        } else {
+            if let Some(w) = wallet_warning(&self.s.coin, &wallet) {
+                self.error = Some(w);
+                return;
+            }
+            let login = if worker.is_empty() { wallet } else { format!("{wallet}.{worker}") };
+            (engine::default_pool(&self.s.coin, self.s.solo, self.s.large).into_iter().collect(), login, "x".into())
+        };
+        let cfg = Config { pools: pools.clone(), login, pass, threads: self.s.threads, light: self.s.light };
         self.s.save();
-        self.log(&format!("starting {} {} on {} with {} threads", self.s.coin.to_uppercase(),
-            if self.s.solo { "SOLO" } else { "PPLNS" }, pools.join(", "), self.s.threads));
+        let what = if self.s.other() { "other pool".to_string() } else { if self.s.solo { "SOLO" } else { "PPLNS" }.to_string() };
+        self.log(&format!("starting {} ({what}) on {} with {} threads", self.s.coin.to_uppercase(), pools.join(", "), self.s.threads));
         self.engine = Some(Engine::start(cfg, self.logger()));
     }
 
@@ -300,7 +335,7 @@ impl eframe::App for App {
                     }
                     ui.add_space(6.0);
                     let wallet = self.s.wallet().trim();
-                    if !wallet.is_empty() {
+                    if !wallet.is_empty() && !self.s.other() {
                         let url = format!("{SITE}/#/miner/{}/{}", self.s.pool_id(), wallet);
                         if ui.link(RichText::new("View my stats on theminershaven.org  ->").color(ACCENT)).clicked() {
                             ctx.open_url(egui::OpenUrl::new_tab(url));
@@ -331,6 +366,19 @@ fn capitalize(s: &str) -> String {
 
 impl App {
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Pool");
+        ui.horizontal(|ui| {
+            for (id, name) in [("mh", "Miners Haven"), ("other", "Other pool")] {
+                let sel = self.s.pool_mode == id;
+                let b = egui::Button::new(RichText::new(name).strong().color(if sel { Color32::WHITE } else { TEXT }))
+                    .fill(if sel { ACCENT_FILL } else { RAISED })
+                    .min_size(egui::vec2(140.0, 32.0));
+                if ui.add(b).clicked() {
+                    self.s.pool_mode = id.into();
+                }
+            }
+        });
+
         section(ui, "Coin");
         ui.horizontal(|ui| {
             for (id, name) in [("qrl", "QRL"), ("xmr", "Monero (XMR)")] {
@@ -344,11 +392,15 @@ impl App {
             }
         });
 
-        section(ui, "Payout");
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.s.solo, false, "PPLNS (steady payouts)");
-            ui.selectable_value(&mut self.s.solo, true, "SOLO");
-        });
+        if self.s.other() {
+            self.other_pool_ui(ui);
+        } else {
+            section(ui, "Payout");
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.s.solo, false, "PPLNS (steady payouts)");
+                ui.selectable_value(&mut self.s.solo, true, "SOLO");
+            });
+        }
 
         section(ui, &format!("{} wallet address", self.s.coin.to_uppercase()));
         ui.add(egui::TextEdit::multiline(self.s.wallet_mut()).desired_rows(3).desired_width(f32::INFINITY)
@@ -366,12 +418,48 @@ impl App {
         egui::CollapsingHeader::new(RichText::new("Advanced").color(MUTED))
             .default_open(!self.s.custom_pool.is_empty() || self.s.large || self.s.light)
             .show(ui, |ui| {
-                ui.checkbox(&mut self.s.large, "Large CPU / rental port (higher start difficulty)");
+                if !self.s.other() {
+                    ui.checkbox(&mut self.s.large, "Large CPU / rental port (higher start difficulty)");
+                }
                 ui.checkbox(&mut self.s.light, "Light mode: 256 MB RAM instead of 2 GB (much slower)");
-                ui.label(RichText::new("Custom pool (host:port, comma for backups)").size(11.0).color(MUTED));
-                ui.add(egui::TextEdit::singleline(&mut self.s.custom_pool).desired_width(f32::INFINITY)
-                    .hint_text(engine::default_pool(&self.s.coin, self.s.solo, self.s.large).unwrap_or_default()));
             });
+    }
+
+    fn other_pool_ui(&mut self, ui: &mut egui::Ui) {
+        // well-known RandomX pools; the address box stays editable
+        const PRESETS: [(&str, &str, &str); 5] = [
+            ("SupportXMR", "xmr", "pool.supportxmr.com:3333"),
+            ("SupportXMR (SSL)", "xmr", "stratum+ssl://pool.supportxmr.com:443"),
+            ("MoneroOcean", "xmr", "gulf.moneroocean.stream:10128"),
+            ("HashVault (SSL)", "xmr", "stratum+ssl://pool.hashvault.pro:443"),
+            ("P2Pool on this PC", "xmr", "127.0.0.1:3333"),
+        ];
+        section(ui, "Pool address");
+        let current = PRESETS.iter().find(|p| p.2 == self.s.other_pool.trim()).map(|p| p.0).unwrap_or("Custom");
+        egui::ComboBox::from_id_salt("preset")
+            .selected_text(current)
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for (name, coin, url) in PRESETS {
+                    if ui.selectable_label(current == name, name).clicked() {
+                        self.s.other_pool = url.into();
+                        self.s.coin = coin.into();
+                    }
+                }
+                if ui.selectable_label(current == "Custom", "Custom (type it below)").clicked() && current != "Custom" {
+                    self.s.other_pool.clear();
+                }
+            });
+        ui.add(egui::TextEdit::singleline(&mut self.s.other_pool).desired_width(f32::INFINITY)
+            .hint_text("host:port   or   stratum+ssl://host:port"));
+        ui.label(RichText::new("Add backups with commas. Use stratum+ssl:// for SSL/TLS ports.").size(11.0).color(MUTED));
+
+        section(ui, "Username (optional)");
+        ui.add(egui::TextEdit::singleline(&mut self.s.other_user).desired_width(f32::INFINITY)
+            .hint_text("leave empty to use your wallet address"));
+        section(ui, "Password (optional)");
+        ui.add(egui::TextEdit::singleline(&mut self.s.other_pass).desired_width(f32::INFINITY)
+            .hint_text("leave empty to send the worker name"));
     }
 
     fn dashboard_ui(&mut self, ui: &mut egui::Ui) {

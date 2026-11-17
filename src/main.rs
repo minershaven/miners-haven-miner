@@ -28,9 +28,17 @@ struct Args {
     #[arg(long)]
     large: bool,
 
-    /// Pool to use instead of the default (host:port). Repeat for failover.
+    /// Pool to use instead of Miners Haven: host:port, or stratum+ssl://host:port for TLS. Repeat for failover.
     #[arg(long, short = 'o')]
     pool: Vec<String>,
+
+    /// Login to send instead of wallet.worker (for other pools that want an account name)
+    #[arg(long, short = 'u')]
+    user: Option<String>,
+
+    /// Password to send to the pool (many pools use it as the worker name)
+    #[arg(long, short = 'p', default_value = "x")]
+    pass: String,
 
     /// Mining threads (default: one per CPU core, minus one when you have more than 4)
     #[arg(long, short = 't')]
@@ -99,7 +107,12 @@ fn main() {
     println!(" memory    {}", hp.describe());
     println!();
 
-    let cfg = Config { pools, login: format!("{wallet}.{}", args.worker), pass: "x".into(), threads, light: args.light };
+    let login = match &args.user {
+        Some(u) => u.clone(),
+        None if args.pool.is_empty() => format!("{wallet}.{}", args.worker),
+        None => wallet.clone(),
+    };
+    let cfg = Config { pools, login, pass: args.pass.clone(), threads, light: args.light };
     let _engine = Engine::start(cfg, log);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
