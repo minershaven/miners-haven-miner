@@ -1,7 +1,10 @@
-# Windows builds from Linux (mingw): link the C++ runtime statically so the .exe runs on any PC
+# Windows builds from Linux (mingw): everything linked statically so the .exe runs on any PC without
+# picking up some other program's libstdc++-6.dll. win-static/ holds the static C++ runtime under the
+# name the linker would otherwise resolve to the DLL import library.
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
-rustflags = ["-C", "link-arg=-static", "-C", "link-arg=-Wl,--start-group",
+rustflags = ["-L", "native=win-static", "-C", "link-arg=-static", "-C", "link-arg=-static-libgcc", "-C", "link-arg=-static-libstdc++",
+             "-C", "link-arg=-Wl,--start-group",
              "-C", "link-arg=-lstdc++", "-C", "link-arg=-lpthread", "-C", "link-arg=-lmingwex", "-C", "link-arg=-lmsvcrt",
              "-C", "link-arg=-lmingw32", "-C", "link-arg=-lgcc", "-C", "link-arg=-lgcc_eh", "-C", "link-arg=-lkernel32",
              "-C", "link-arg=-ladvapi32", "-C", "link-arg=-Wl,--end-group"]

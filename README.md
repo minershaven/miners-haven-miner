@@ -29,3 +29,10 @@ Rust 1.85+, CMake and a C++ compiler:
 ```
 cargo build --release
 ```
+
+Windows .exe from Linux (mingw-w64):
+
+```
+mkdir -p win-static && cp $(x86_64-w64-mingw32-g++ -print-file-name=libstdc++.a) win-static/libstdc++.dll.a
+cargo build --release --target x86_64-pc-windows-gnu
+```
