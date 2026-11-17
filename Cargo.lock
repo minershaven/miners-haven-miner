@@ -1478,6 +1478,7 @@ dependencies = [
  "eframe",
  "hex",
  "num_cpus",
+ "qp-poseidon-core",
  "randomx-rs",
  "rustls",
  "serde",
@@ -2136,6 +2137,12 @@ name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
+
+[[package]]
+name = "qp-poseidon-core"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5872607e25ea4ee5fb37e64bf1462168e1a36a4e719cdc8a105533c708253918"
 
 [[package]]
 name = "quick-error"

@@ -6,7 +6,7 @@ use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 use mhminer::engine::{self, hr, Config, Engine, Log};
 use mhminer::hugepages::{self, Status};
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +34,8 @@ struct Settings {
     solo: bool,
     wallet_qrl: String,
     wallet_xmr: String,
+    /// wallet address per coin id
+    wallets: BTreeMap<String, String>,
     worker: String,
     threads: usize,
     large: bool,
@@ -54,6 +56,7 @@ impl Default for Settings {
             solo: false,
             wallet_qrl: String::new(),
             wallet_xmr: String::new(),
+            wallets: BTreeMap::new(),
             worker: hostname(),
             threads: engine::default_threads(),
             large: false,
@@ -89,6 +92,15 @@ impl Settings {
             s.other_pool = std::mem::take(&mut s.custom_pool);
             s.pool_mode = "other".into();
         }
+        // wallets used to be one field per coin
+        for (id, w) in [("qrl", std::mem::take(&mut s.wallet_qrl)), ("xmr", std::mem::take(&mut s.wallet_xmr))] {
+            if !w.is_empty() {
+                s.wallets.entry(id.into()).or_insert(w);
+            }
+        }
+        if engine::coin(&s.coin).is_none() {
+            s.coin = "qrl".into();
+        }
         if s.pool_mode != "other" {
             s.pool_mode = "mh".into();
         }
@@ -107,13 +119,16 @@ impl Settings {
         }
     }
     fn wallet(&self) -> &str {
-        if self.coin == "xmr" { &self.wallet_xmr } else { &self.wallet_qrl }
+        self.wallets.get(&self.coin).map(|s| s.as_str()).unwrap_or("")
     }
     fn wallet_mut(&mut self) -> &mut String {
-        if self.coin == "xmr" { &mut self.wallet_xmr } else { &mut self.wallet_qrl }
+        self.wallets.entry(self.coin.clone()).or_default()
     }
     fn pool_id(&self) -> String {
-        format!("{}-{}", self.coin, if self.solo { "solo" } else { "pplns" })
+        engine::pool_id(&self.coin, self.solo)
+    }
+    fn coin(&self) -> &'static engine::Coin {
+        engine::coin(&self.coin).unwrap_or(&engine::COINS[0])
     }
 }
 
@@ -168,7 +183,7 @@ impl App {
         self.error = None;
         let wallet = self.s.wallet().trim().to_string();
         if wallet.is_empty() {
-            self.error = Some(format!("Enter your {} wallet address first.", self.s.coin.to_uppercase()));
+            self.error = Some(format!("Enter your {} wallet address first.", self.s.coin().symbol));
             return;
         }
         let worker = self.s.worker.trim().replace(['.', ' '], "-");
@@ -195,10 +210,12 @@ impl App {
             let login = if worker.is_empty() { wallet } else { format!("{wallet}.{worker}") };
             (engine::default_pool(&self.s.coin, self.s.solo, self.s.large).into_iter().collect(), login, "x".into())
         };
-        let cfg = Config { pools: pools.clone(), login, pass, threads: self.s.threads, light: self.s.light };
+        let cfg = Config { algo: self.s.coin().algo, pools: pools.clone(), login, pass, threads: self.s.threads, light: self.s.light, gpus: vec![] };
         self.s.save();
         let what = if self.s.other() { "other pool".to_string() } else { if self.s.solo { "SOLO" } else { "PPLNS" }.to_string() };
-        self.log(&format!("starting {} ({what}) on {} with {} threads", self.s.coin.to_uppercase(), pools.join(", "), self.s.threads));
+        let c = self.s.coin();
+        let dev = if c.algo.gpu() { "GPU".to_string() } else { format!("{} CPU threads", self.s.threads) };
+        self.log(&format!("starting {} - {} ({what}) on {} with {dev}", c.symbol, c.algo.name(), pools.join(", ")));
         self.engine = Some(Engine::start(cfg, self.logger()));
     }
 
@@ -380,17 +397,23 @@ impl App {
         });
 
         section(ui, "Coin");
-        ui.horizontal(|ui| {
-            for (id, name) in [("qrl", "QRL"), ("xmr", "Monero (XMR)")] {
-                let sel = self.s.coin == id;
-                let b = egui::Button::new(RichText::new(name).strong().color(if sel { Color32::WHITE } else { TEXT }))
-                    .fill(if sel { ACCENT_FILL } else { RAISED })
-                    .min_size(egui::vec2(140.0, 32.0));
-                if ui.add(b).clicked() {
-                    self.s.coin = id.into();
+        let cur = self.s.coin();
+        egui::ComboBox::from_id_salt("coin")
+            .selected_text(RichText::new(format!("{}  -  {}", cur.symbol, cur.name)).strong())
+            .width(ui.available_width())
+            .height(400.0)
+            .show_ui(ui, |ui| {
+                for c in engine::COINS {
+                    let tag = if c.algo.gpu() { "GPU" } else { "CPU" };
+                    let label = format!("{:<5} {}   ({}, {tag})", c.symbol, c.name, c.algo.name());
+                    if ui.selectable_label(self.s.coin == c.id, label).clicked() {
+                        self.s.coin = c.id.into();
+                    }
                 }
-            }
-        });
+            });
+        let c = self.s.coin();
+        ui.label(RichText::new(format!("{} - mined on your {}", c.algo.name(), if c.algo.gpu() { "graphics card" } else { "processor" }))
+            .size(11.0).color(MUTED));
 
         if self.s.other() {
             self.other_pool_ui(ui);
@@ -402,15 +425,17 @@ impl App {
             });
         }
 
-        section(ui, &format!("{} wallet address", self.s.coin.to_uppercase()));
+        section(ui, &format!("{} wallet address", self.s.coin().symbol));
         ui.add(egui::TextEdit::multiline(self.s.wallet_mut()).desired_rows(3).desired_width(f32::INFINITY)
             .hint_text("Paste the address the pool should pay"));
 
         section(ui, "Worker name");
         ui.add(egui::TextEdit::singleline(&mut self.s.worker).desired_width(f32::INFINITY));
 
-        section(ui, &format!("CPU threads  ({} available)", self.cores));
-        ui.add(egui::Slider::new(&mut self.s.threads, 1..=self.cores));
+        if !self.s.coin().algo.gpu() {
+            section(ui, &format!("CPU threads  ({} available)", self.cores));
+            ui.add(egui::Slider::new(&mut self.s.threads, 1..=self.cores));
+        }
 
         ui.add_space(4.0);
         ui.checkbox(&mut self.s.start_on_open, "Start mining when the app opens");
@@ -421,7 +446,9 @@ impl App {
                 if !self.s.other() {
                     ui.checkbox(&mut self.s.large, "Large CPU / rental port (higher start difficulty)");
                 }
-                ui.checkbox(&mut self.s.light, "Light mode: 256 MB RAM instead of 2 GB (much slower)");
+                if self.s.coin().algo == engine::Algo::RandomX {
+                    ui.checkbox(&mut self.s.light, "Light mode: 256 MB RAM instead of 2 GB (much slower)");
+                }
             });
     }
 

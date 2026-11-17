@@ -2,13 +2,13 @@
 
 use clap::Parser;
 use mhminer::engine::{self, hr, Config, Engine, Log};
-use mhminer::{hugepages, rx};
+use mhminer::{hugepages, qtcminer, rx, rxminer};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "mhminer", version, about = "Miners Haven Miner - RandomX CPU miner for theminershaven.org")]
 struct Args {
-    /// Coin to mine: qrl or xmr. Picks the Miners Haven pool and port for you.
+    /// Coin to mine: qrl, xmr, qtc, neox, abrs, firo or zano. Picks the Miners Haven pool and port for you.
     #[arg(long, default_value = "qrl")]
     coin: String,
 
@@ -63,7 +63,7 @@ fn main() {
     let log: Log = Arc::new(|m: &str| println!("[{}] {m}", engine::timestamp()));
 
     if args.selftest {
-        let res = engine::selftest();
+        let res = rxminer::selftest();
         for (input, pass) in &res {
             println!(" selftest {:<28} {}", format!("\"{input}\""), if *pass { "OK" } else { "FAILED" });
         }
@@ -77,10 +77,25 @@ fn main() {
     let cores = num_cpus::get();
     let threads = args.threads.unwrap_or_else(engine::default_threads).max(1);
 
+    let Some(coin) = engine::coin(&args.coin) else {
+        eprintln!("Unknown coin '{}'. Choose one of: {}", args.coin,
+            engine::COINS.iter().map(|c| c.id).collect::<Vec<_>>().join(", "));
+        std::process::exit(2);
+    };
+
     if let Some(secs) = args.bench {
-        println!(" {}", hp.describe());
-        let rate = engine::bench(threads, args.light, secs, log);
-        println!(" benchmark: {} with {threads} threads ({} mode)", hr(rate), if args.light { "light" } else { "fast" });
+        match coin.algo {
+            engine::Algo::RandomX => {
+                println!(" {}", hp.describe());
+                let rate = rxminer::bench(threads, args.light, secs, log);
+                println!(" benchmark RandomX: {} with {threads} threads ({} mode)", hr(rate), if args.light { "light" } else { "fast" });
+            }
+            engine::Algo::QPow => {
+                let rate = qtcminer::bench(threads, secs);
+                println!(" benchmark QPoW: {} with {threads} threads", hr(rate));
+            }
+            a => println!(" benchmark for {} is not available yet", a.name()),
+        }
         return;
     }
 
@@ -89,18 +104,12 @@ fn main() {
         std::process::exit(2);
     };
     let pools = if args.pool.is_empty() {
-        match engine::default_pool(&args.coin.to_lowercase(), args.solo, args.large) {
-            Some(p) => vec![p],
-            None => {
-                eprintln!("Unknown coin '{}'. Use --coin qrl or --coin xmr, or give a pool with --pool host:port", args.coin);
-                std::process::exit(2);
-            }
-        }
+        vec![engine::default_pool(coin.id, args.solo, args.large).unwrap()]
     } else {
         args.pool.clone()
     };
 
-    println!(" coin      {}  ({})", args.coin.to_uppercase(), if args.solo { "SOLO" } else { "PPLNS" });
+    println!(" coin      {} - {}  ({})", coin.symbol, coin.algo.name(), if args.solo { "SOLO" } else { "PPLNS" });
     println!(" pool      {}", pools.join(", "));
     println!(" threads   {threads} of {cores} cores, {} mode", if args.light { "light (256 MB)" } else { "fast (2 GB)" });
     println!(" cpu       JIT {}  AES {}", yes(cpu & rx::FLAG_JIT != 0), yes(cpu & rx::FLAG_HARD_AES != 0));
@@ -112,7 +121,7 @@ fn main() {
         None if args.pool.is_empty() => format!("{wallet}.{}", args.worker),
         None => wallet.clone(),
     };
-    let cfg = Config { pools, login, pass: args.pass.clone(), threads, light: args.light };
+    let cfg = Config { algo: coin.algo, pools, login, pass: args.pass.clone(), threads, light: args.light, gpus: vec![] };
     let _engine = Engine::start(cfg, log);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));

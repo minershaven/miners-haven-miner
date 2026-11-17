@@ -4,7 +4,6 @@
 //! Pool addresses: `host:port`, `stratum+tcp://host:port`, or `stratum+ssl://host:port` (also
 //! `ssl://`, `tls://`, `stratum+tls://`) for encrypted connections.
 
-use crate::job::{Job, RawJob};
 use serde_json::{json, Value};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
@@ -16,15 +15,10 @@ use std::time::{Duration, Instant};
 pub enum Event {
     Connected(String),
     Disconnected(String),
-    NewJob(Job),
+    /// the pool's job object, as sent (its layout depends on the coin)
+    NewJob(Value),
     Accepted,
     Rejected(String),
-}
-
-pub struct Share {
-    pub job_id: String,
-    pub nonce: u32,
-    pub hash: [u8; 32],
 }
 
 #[derive(Clone)]
@@ -146,11 +140,11 @@ impl Client {
     }
 
     /// Connect, log in and read messages forever, reconnecting (with failover across `pools`) on errors.
-    pub fn run(&self, pools: Vec<String>, login: String, pass: String, events: Sender<Event>) {
+    pub fn run(&self, pools: Vec<String>, login: String, pass: String, algos: Vec<String>, events: Sender<Event>) {
         let mut idx = 0usize;
         while !self.stopped.load(Ordering::SeqCst) {
             let pool = &pools[idx % pools.len()];
-            if let Err(e) = self.session(pool, &login, &pass, &events) {
+            if let Err(e) = self.session(pool, &login, &pass, &algos, &events) {
                 *self.inner.lock().unwrap() = None;
                 let _ = events.send(Event::Disconnected(format!("{pool}: {e}")));
             }
@@ -171,13 +165,13 @@ impl Client {
         *self.inner.lock().unwrap() = None;
     }
 
-    fn session(&self, pool_s: &str, login: &str, pass: &str, events: &Sender<Event>) -> Result<(), String> {
+    fn session(&self, pool_s: &str, login: &str, pass: &str, algos: &[String], events: &Sender<Event>) -> Result<(), String> {
         let pool = parse_pool(pool_s)?;
         let mut stream = open(&pool)?;
         let (out_tx, out_rx): (Sender<String>, Receiver<String>) = mpsc::channel();
 
         let req = json!({"id": 1, "jsonrpc": "2.0", "method": "login",
-            "params": {"login": login, "pass": pass, "agent": AGENT, "algo": ["rx/0"]}});
+            "params": {"login": login, "pass": pass, "agent": AGENT, "algo": algos}});
         stream.write_all(format!("{req}\n").as_bytes()).map_err(|e| e.to_string())?;
         stream.flush().ok();
 
@@ -265,10 +259,9 @@ impl Client {
     }
 
     fn push_job(&self, j: &Value, events: &Sender<Event>) {
-        match serde_json::from_value::<RawJob>(j.clone()).map_err(|e| e.to_string()).and_then(|r| Job::from_raw(&r)) {
-            Ok(job) => { let _ = events.send(Event::NewJob(job)); }
-            Err(e) => { let _ = events.send(Event::Rejected(format!("unusable job: {e}"))); }
-        }
+        // Quantus-style pools wrap the job: {"clean_jobs": .., "job": {...}}
+        let job = j.get("job").filter(|x| x.is_object()).unwrap_or(j);
+        let _ = events.send(Event::NewJob(job.clone()));
     }
 
     fn session_id(&self) -> String {
@@ -282,11 +275,11 @@ impl Client {
         }
     }
 
-    pub fn submit(&self, s: &Share) -> bool {
+    /// Send a share. `params` holds the coin-specific fields; the session id is added here.
+    pub fn submit(&self, mut params: Value) -> bool {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.send(json!({"id": id, "jsonrpc": "2.0", "method": "submit", "params": {
-            "id": self.session_id(), "job_id": s.job_id,
-            "nonce": hex::encode(s.nonce.to_le_bytes()), "result": hex::encode(s.hash)}}))
+        params["id"] = Value::String(self.session_id());
+        self.send(json!({"id": id, "jsonrpc": "2.0", "method": "submit", "params": params}))
     }
 }
 
