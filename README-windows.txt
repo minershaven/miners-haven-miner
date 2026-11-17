@@ -1,9 +1,10 @@
-Miners Haven Miner 2.1  -  theminershaven.org
+Miners Haven Miner 2.2  -  theminershaven.org
 =============================================
 
 COINS
-  On your processor (CPU):    QRL, XMR (RandomX)   QTC (QPoW)
+  On your processor (CPU):    QRL, XMR (RandomX)
   On your graphics card (GPU): NEOX, ABRS (KawPoW)  FIRO (FiroPoW)  ZANO (ProgPowZ)
+  On GPU and/or CPU:           QTC (QPoW)
   GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
 
 DESKTOP APP

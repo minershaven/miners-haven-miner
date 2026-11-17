@@ -6,6 +6,7 @@ pub mod cl;
 pub mod kernel;
 pub mod pool;
 pub mod progpow;
+pub mod qpow_cl;
 pub mod sensors;
 
 use crate::engine::{hr, spawn_meter, Algo, Backend, Config, Log, Stats};
@@ -352,4 +353,9 @@ pub fn bench(algo: Algo, gpus: &[usize], secs: u64, log: Log) -> f64 {
     }
     let r = *total.lock().unwrap();
     r
+}
+
+/// QPoW (Quantus) GPU benchmark.
+pub fn bench_qpow(gpus: &[usize], secs: u64, log: Log) -> f64 {
+    crate::qtcminer::bench_gpu(gpus, secs, log)
 }

@@ -32,8 +32,13 @@ impl Algo {
             Algo::ProgPowZ => "ProgPowZ",
         }
     }
+    /// GPU only (no CPU mining)
     pub fn gpu(self) -> bool {
         matches!(self, Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ)
+    }
+    /// can use graphics cards
+    pub fn gpu_capable(self) -> bool {
+        self.gpu() || self == Algo::QPow
     }
 }
 

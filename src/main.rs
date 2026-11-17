@@ -83,7 +83,13 @@ fn main() {
     let hp = hugepages::setup();
     let cpu = rx::cpu_flags();
     let cores = num_cpus::get();
-    let threads = args.threads.unwrap_or_else(engine::default_threads).max(1);
+    // Quantus on a PC with a GPU: the GPU does the work unless --threads asks for CPU threads too
+    let qtc_gpu = engine::coin(&args.coin).map(|c| c.algo == engine::Algo::QPow).unwrap_or(false) && !gpu::list_gpus().is_empty();
+    let threads = match args.threads {
+        Some(t) => if qtc_gpu { t } else { t.max(1) },
+        None if qtc_gpu && args.bench.is_none() => 0,
+        None => engine::default_threads(),
+    };
 
     let Some(coin) = engine::coin(&args.coin) else {
         eprintln!("Unknown coin '{}'. Choose one of: {}", args.coin,
@@ -99,8 +105,9 @@ fn main() {
                 println!(" benchmark RandomX: {} with {threads} threads ({} mode)", hr(rate), if args.light { "light" } else { "fast" });
             }
             engine::Algo::QPow => {
+                let g = gpu::bench_qpow(&args.gpus, secs, log.clone());
                 let rate = qtcminer::bench(threads, secs);
-                println!(" benchmark QPoW: {} with {threads} threads", hr(rate));
+                println!(" benchmark QPoW: CPU {} with {threads} threads, GPU {}", hr(rate), hr(g));
             }
             a => {
                 for g in gpu::list_gpus() {

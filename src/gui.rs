@@ -235,12 +235,23 @@ impl App {
             self.error = Some(format!("{} is mined on a graphics card, and no OpenCL GPU was found. Install the latest NVIDIA or AMD driver.", self.s.coin().symbol));
             return;
         }
-        let gpus: Vec<usize> = self.s.gpus.iter().copied().filter(|i| self.gpus.iter().any(|g| g.index == *i)).collect();
+        // empty = all GPUs; [usize::MAX] = none ticked
+        let none_ticked = self.s.gpus == vec![usize::MAX] || (!self.s.gpus.is_empty() && !self.s.gpus.iter().any(|i| self.gpus.iter().any(|g| g.index == *i)));
+        if self.s.coin().algo.gpu() && none_ticked {
+            self.error = Some("Tick at least one graphics card.".into());
+            return;
+        }
+        let gpu_capable = self.s.coin().algo.gpu_capable() && !self.gpus.is_empty();
+        if self.s.coin().algo == engine::Algo::QPow && (none_ticked || !gpu_capable) && self.s.threads == 0 {
+            self.error = Some("Pick at least one CPU thread or a graphics card.".into());
+            return;
+        }
+        let gpus: Vec<usize> = if none_ticked { vec![usize::MAX] } else { self.s.gpus.clone() };
         let cfg = Config { algo: self.s.coin().algo, pools: pools.clone(), login, pass, threads: self.s.threads, light: self.s.light, gpus };
         self.s.save();
         let what = if self.s.other() { "other pool".to_string() } else { if self.s.solo { "SOLO" } else { "PPLNS" }.to_string() };
         let c = self.s.coin();
-        let dev = if c.algo.gpu() { "GPU".to_string() } else { format!("{} CPU threads", self.s.threads) };
+        let dev = if c.algo.gpu() { "GPU".to_string() } else if c.algo.gpu_capable() && !self.gpus.is_empty() { format!("GPU + {} CPU threads", self.s.threads) } else { format!("{} CPU threads", self.s.threads) };
         self.log(&format!("starting {} - {} ({what}) on {} with {dev}", c.symbol, c.algo.name(), pools.join(", ")));
         self.engine = Some(Engine::start(cfg, self.logger()));
     }
@@ -498,22 +509,29 @@ impl App {
         section(ui, "Worker name");
         ui.add(egui::TextEdit::singleline(&mut self.s.worker).desired_width(f32::INFINITY));
 
-        if !self.s.coin().algo.gpu() {
+        let algo = self.s.coin().algo;
+        if !algo.gpu() {
+            let min = if algo.gpu_capable() && !self.gpus.is_empty() { 0 } else { 1 };
+            self.s.threads = self.s.threads.max(min);
             section(ui, &format!("CPU threads  ({} available)", self.cores));
-            ui.add(egui::Slider::new(&mut self.s.threads, 1..=self.cores));
-        } else {
+            ui.add(egui::Slider::new(&mut self.s.threads, min..=self.cores));
+            if min == 0 {
+                ui.label(RichText::new("Your graphics card does most of the work; 0 leaves the processor free.").size(11.0).color(MUTED));
+            }
+        }
+        if algo.gpu_capable() {
             section(ui, "Graphics cards");
             if self.gpus.is_empty() {
                 ui.label(RichText::new("No OpenCL GPU found - install the latest NVIDIA or AMD driver.").color(WARN));
             }
             for g in self.gpus.clone() {
-                let mut on = self.s.gpus.is_empty() || self.s.gpus.contains(&g.index);
+                let mut on = self.s.gpus.is_empty() || (self.s.gpus.contains(&g.index) && self.s.gpus != vec![usize::MAX]);
                 if ui.checkbox(&mut on, format!("GPU{}  {}  ({:.0} GB)", g.index, g.name, g.memory as f64 / 1073741824.0)).changed() {
                     let mut sel: Vec<usize> = if self.s.gpus.is_empty() { self.gpus.iter().map(|x| x.index).collect() } else { self.s.gpus.clone() };
                     if on { if !sel.contains(&g.index) { sel.push(g.index); } } else { sel.retain(|x| *x != g.index); }
                     sel.sort();
                     // all selected is stored as "all", so new cards get used too
-                    self.s.gpus = if sel.len() == self.gpus.len() { vec![] } else { sel };
+                    self.s.gpus = if sel.len() == self.gpus.len() { vec![] } else if sel.is_empty() { vec![usize::MAX] } else { sel };
                 }
             }
         }
@@ -616,7 +634,7 @@ impl App {
             Some(e) => (e.stats.diff_text.lock().unwrap().clone(), e.stats.devices.lock().unwrap().clone()),
             None => (String::new(), vec![]),
         };
-        let gpu_coin = self.s.coin().algo.gpu();
+        let gpu_coin = self.s.coin().algo.gpu() || (self.s.coin().algo.gpu_capable() && !devices.is_empty());
 
         ui.columns(4, |c| {
             card(&mut c[0], "Hashrate", hr(rate), ACCENT);

@@ -45,7 +45,9 @@ struct Shared {
     job: RwLock<Option<Arc<Job>>>,
     job_gen: AtomicU64,
     stop: Arc<AtomicBool>,
+    /// one counter per CPU thread, then one per GPU
     hashes: Vec<AtomicU64>,
+    gpu_rates: Vec<std::sync::Mutex<f64>>,
 }
 
 pub struct QtcMiner {
@@ -73,12 +75,21 @@ fn salt() -> u64 {
 }
 
 pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
-    let threads = cfg.threads.max(1);
+    let gpus: Vec<crate::gpu::cl::GpuInfo> =
+        crate::gpu::list_gpus().into_iter().filter(|g| cfg.gpus.is_empty() || cfg.gpus.contains(&g.index)).collect();
+    let threads = if gpus.is_empty() { cfg.threads.max(1) } else { cfg.threads };
+    for g in &gpus {
+        log(&format!("GPU{} {}", g.index, g.name));
+    }
+    if threads > 0 {
+        log(&format!("CPU: {threads} threads"));
+    }
     let shared = Arc::new(Shared {
         job: RwLock::new(None),
         job_gen: AtomicU64::new(0),
         stop: Arc::new(AtomicBool::new(false)),
-        hashes: (0..threads).map(|_| AtomicU64::new(0)).collect(),
+        hashes: (0..threads + gpus.len()).map(|_| AtomicU64::new(0)).collect(),
+        gpu_rates: gpus.iter().map(|_| std::sync::Mutex::new(0.0)).collect(),
     });
     let client = Client::new();
     let (ev_tx, ev_rx) = mpsc::channel::<Event>();
@@ -100,6 +111,37 @@ pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
     for t in 0..threads {
         let (sh, tx) = (shared.clone(), share_tx.clone());
         handles.push(std::thread::spawn(move || worker(t, sh, tx)));
+    }
+    for (i, g) in gpus.iter().cloned().enumerate() {
+        let (sh, tx, lg) = (shared.clone(), share_tx.clone(), log.clone());
+        let slot = threads + i;
+        if let Ok(h) = std::thread::Builder::new().stack_size(64 << 20).spawn(move || gpu_worker(slot, i, g, sh, tx, lg)) {
+            handles.push(h);
+        }
+    }
+    // per-GPU speed, temperature, fan and power for the app
+    if !gpus.is_empty() {
+        let (sh, st, lg, gs) = (shared.clone(), stats.clone(), log.clone(), gpus.clone());
+        handles.push(std::thread::spawn(move || {
+            let sensors = crate::gpu::sensors::Sensors::new();
+            let mut hot = std::time::Instant::now() - Duration::from_secs(600);
+            while !sh.stop.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(2));
+                let mut lines = Vec::new();
+                let mut hottest = 0u32;
+                for (i, g) in gs.iter().enumerate() {
+                    let rd = sensors.read(g.nvidia, g.pci_bus, g.nvidia_index);
+                    hottest = hottest.max(rd.temp_c.unwrap_or(0));
+                    lines.push(format!("GPU{} {}   {:>11}   {}", g.index, g.name, crate::engine::hr(*sh.gpu_rates[i].lock().unwrap()), rd.text()));
+                    if rd.temp_c.unwrap_or(0) >= 85 && hot.elapsed() > Duration::from_secs(300) {
+                        hot = std::time::Instant::now();
+                        lg(&format!("GPU{} is running hot ({}C) - check its fans and airflow", g.index, rd.temp_c.unwrap()));
+                    }
+                }
+                st.gpu_temp.store(hottest as u64, Ordering::Relaxed);
+                *st.devices.lock().unwrap() = lines;
+            }
+        }));
     }
     drop(share_tx);
     {
@@ -153,29 +195,118 @@ fn worker(tid: usize, sh: Arc<Shared>, shares: mpsc::Sender<(String, [u8; 64])>)
             std::thread::sleep(Duration::from_millis(200));
             continue;
         };
-        // nonce = extranonce | per-job salt | thread id | counter
+        // nonce = extranonce | per-job salt | thread id   (first half, fixed -> midstate)
+        //         zeros | counter                          (second half, counted)
         let mut nonce = [0u8; 64];
         let en = job.extranonce.len().min(8);
         nonce[..en].copy_from_slice(&job.extranonce[..en]);
-        nonce[40..48].copy_from_slice(&job.salt.to_be_bytes());
-        nonce[48..56].copy_from_slice(&(tid as u64).to_be_bytes());
+        nonce[8..16].copy_from_slice(&job.salt.to_be_bytes());
+        nonce[16..24].copy_from_slice(&(tid as u64).to_be_bytes());
+        let mid = crate::qpow::midstate(&job.mining_hash, nonce[..32].try_into().unwrap());
+        let mut half = [0u8; 32];
         let mut counter: u64 = 0;
         let hashes = &sh.hashes[tid];
         loop {
-            for _ in 0..32 {
-                nonce[56..64].copy_from_slice(&counter.to_be_bytes());
-                let h = qpow_hash(&job.mining_hash, &nonce);
-                if u128::from_be_bytes(h[..16].try_into().unwrap()) < job.target_hi {
-                    let _ = shares.send((job.id.clone(), nonce));
+            for _ in 0..64 {
+                half[24..32].copy_from_slice(&counter.to_be_bytes());
+                if crate::qpow::hash_hi128(&mid, &half) < job.target_hi {
+                    nonce[32..].copy_from_slice(&half);
+                    // confirm with the reference implementation before sending
+                    let h = qpow_hash(&job.mining_hash, &nonce);
+                    if u128::from_be_bytes(h[..16].try_into().unwrap()) < job.target_hi {
+                        let _ = shares.send((job.id.clone(), nonce));
+                    }
                 }
                 counter += 1;
             }
-            hashes.fetch_add(32, Ordering::Relaxed);
+            hashes.fetch_add(64, Ordering::Relaxed);
             if sh.job_gen.load(Ordering::Relaxed) != seen || sh.stop.load(Ordering::Relaxed) {
                 break;
             }
         }
     }
+}
+
+fn gpu_worker(slot: usize, gi: usize, info: crate::gpu::cl::GpuInfo, sh: Arc<Shared>, shares: mpsc::Sender<(String, [u8; 64])>, log: Log) {
+    let name = format!("GPU{}", info.index);
+    let mut gpu = match crate::gpu::qpow_cl::QpowGpu::open_checked(&info) {
+        Ok(g) => g,
+        Err(e) => { log(&format!("{name}: could not start: {e}")); return; }
+    };
+    log(&format!("{name}: QPoW kernel ready ({})", if gpu.ptx { "NVIDIA fast path, verified" } else { "portable" }));
+    let mut batch: usize = 1 << 22;
+    while !sh.stop.load(Ordering::Relaxed) {
+        let seen = sh.job_gen.load(Ordering::SeqCst);
+        let Some(job) = sh.job.read().unwrap().clone() else {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+        // first half of the nonce: extranonce | salt | 0x80+GPU number (CPU threads use 0..)
+        let mut nonce = [0u8; 64];
+        let en = job.extranonce.len().min(8);
+        nonce[..en].copy_from_slice(&job.extranonce[..en]);
+        nonce[8..16].copy_from_slice(&job.salt.to_be_bytes());
+        nonce[16..24].copy_from_slice(&(0x8000_0000_0000_0000u64 | gi as u64).to_be_bytes());
+        let mid = crate::qpow::midstate(&job.mining_hash, nonce[..32].try_into().unwrap());
+        if let Err(e) = gpu.set_midstate(&crate::qpow::state_u64(&mid)) {
+            log(&format!("{name}: {e}"));
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+        let target64 = (job.target_hi >> 64) as u64;
+        let mut counter: u64 = 0;
+        while sh.job_gen.load(Ordering::Relaxed) == seen && !sh.stop.load(Ordering::Relaxed) {
+            let t0 = std::time::Instant::now();
+            let found = match gpu.search(counter, target64, batch) {
+                Ok(f) => f,
+                Err(e) => { log(&format!("{name}: {e}")); std::thread::sleep(Duration::from_secs(5)); break; }
+            };
+            let dt = t0.elapsed().as_secs_f64();
+            counter = counter.wrapping_add(batch as u64);
+            sh.hashes[slot].fetch_add(batch as u64, Ordering::Relaxed);
+            *sh.gpu_rates[gi].lock().unwrap() = batch as f64 / dt.max(1e-6);
+            if dt < 0.15 && batch < (1 << 30) { batch *= 2; } else if dt > 0.6 && batch > (1 << 18) { batch /= 2; }
+            for c in found {
+                nonce[56..64].copy_from_slice(&c.to_be_bytes());
+                for b in &mut nonce[32..56] { *b = 0; }
+                let h = qpow_hash(&job.mining_hash, &nonce);
+                if u128::from_be_bytes(h[..16].try_into().unwrap()) < job.target_hi {
+                    let _ = shares.send((job.id.clone(), nonce));
+                }
+            }
+        }
+    }
+}
+
+/// GPU benchmark: total hashrate of the selected GPUs over `secs` seconds.
+pub fn bench_gpu(gpus: &[usize], secs: u64, log: Log) -> f64 {
+    let infos: Vec<_> = crate::gpu::list_gpus().into_iter().filter(|g| gpus.is_empty() || gpus.contains(&g.index)).collect();
+    let mut total = 0.0;
+    for info in infos {
+        let mut g = match crate::gpu::qpow_cl::QpowGpu::open_checked(&info) { Ok(g) => g, Err(e) => { log(&e); continue; } };
+        log(&format!("GPU{}: {} kernel", info.index, if g.ptx { "NVIDIA fast-path (verified against the CPU)" } else { "portable" }));
+        let mid = crate::qpow::midstate(&[5; 32], &[9; 32]);
+        let _ = g.set_midstate(&crate::qpow::state_u64(&mid));
+        let mut batch = 1usize << 22;
+        let mut c = 0u64;
+        for _ in 0..8 {
+            let t = std::time::Instant::now();
+            let _ = g.search(c, 0, batch);
+            c += batch as u64;
+            if t.elapsed().as_secs_f64() < 0.15 && batch < (1 << 30) { batch *= 2; }
+        }
+        let t0 = std::time::Instant::now();
+        let mut done = 0u64;
+        while t0.elapsed().as_secs() < secs {
+            let _ = g.search(c, 0, batch);
+            c += batch as u64;
+            done += batch as u64;
+        }
+        let r = done as f64 / t0.elapsed().as_secs_f64();
+        log(&format!("GPU{} {}: {}", info.index, info.name, crate::engine::hr(r)));
+        total += r;
+    }
+    total
 }
 
 /// Hash for `secs` seconds and return hashes per second.
@@ -186,6 +317,7 @@ pub fn bench(threads: usize, secs: u64) -> f64 {
         job_gen: AtomicU64::new(0),
         stop: Arc::new(AtomicBool::new(false)),
         hashes: (0..threads).map(|_| AtomicU64::new(0)).collect(),
+        gpu_rates: vec![],
     });
     let (tx, _rx) = mpsc::channel();
     let hs: Vec<_> = (0..threads).map(|t| { let (s, x) = (sh.clone(), tx.clone()); std::thread::spawn(move || worker(t, s, x)) }).collect();

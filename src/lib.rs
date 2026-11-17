@@ -4,6 +4,7 @@ pub mod engine;
 pub mod gpu;
 pub mod hugepages;
 pub mod job;
+pub mod qpow;
 pub mod qtcminer;
 pub mod rx;
 pub mod rxminer;
