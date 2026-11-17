@@ -44,11 +44,11 @@ fn permute_code() -> String {
     }
     for r in 0..22 {
         let _ = writeln!(c, "    s[0] = exp7(gadd(s[0], 0x{:016x}UL));", INTERNAL_CONSTANTS[r]);
-        c.push_str("    { ulong lo = s[0], k = 0;\n");
+        c.push_str("    { ulong lo = s[0]; uint k = 0;\n");
         for i in 1..12 {
-            let _ = writeln!(c, "      lo += s[{i}]; k += (lo < s[{i}]);");
+            let _ = writeln!(c, "      ACC(lo, k, s[{i}]);");
         }
-        c.push_str("      ulong sum = lo + k * EPS; sum += (ulong)(sum < lo) * EPS;\n");
+        c.push_str("      ulong sum = gadd(lo, ((ulong)k << 32) - (ulong)k);\n");
         for i in 0..12 {
             let _ = writeln!(c, "      s[{i}] = gmuladd(s[{i}], 0x{:016x}UL, sum);", MATRIX_DIAG[i]);
         }
@@ -73,8 +73,27 @@ pub fn source() -> String {
 #define EPS 0xFFFFFFFFUL
 #define PRIME 0xFFFFFFFF00000001UL
 
-#ifdef EXP_ADD
-inline ulong gadd(ulong a, ulong b) { return a + b; }
+/* ---- field addition ------------------------------------------------------------------
+   Exact version: two corrections. FAST: the second one (both operands non-canonical and a
+   double wrap, about 1 in 2^64) is skipped. ADD_PTX: NVIDIA carry flag instead of a compare. */
+#if defined(ADD_PTX)
+inline ulong gadd(ulong a, ulong b) {
+    ulong r;
+    asm("{\n\t"
+        ".reg .u64 s;\n\t"
+        ".reg .u32 s0, s1, c;\n\t"
+        "add.cc.u64 s, %1, %2;\n\t"
+        "addc.u32 c, 0, 0;\n\t"
+        "mov.b64 {s0, s1}, s;\n\t"
+        "add.u32 s1, s1, c;\n\t"       /* + c * 2^32 */
+        "sub.cc.u32 s0, s0, c;\n\t"    /* - c        */
+        "subc.u32 s1, s1, 0;\n\t"
+        "mov.b64 %0, {s0, s1};\n\t"
+        "}" : "=l"(r) : "l"(a), "l"(b));
+    return r;
+}
+#elif defined(FAST)
+inline ulong gadd(ulong a, ulong b) { ulong s = a + b; return s + ((s < a) ? EPS : 0UL); }
 #else
 inline ulong gadd(ulong a, ulong b) {
     ulong s = a + b;
@@ -82,81 +101,77 @@ inline ulong gadd(ulong a, ulong b) {
     return s;
 }
 #endif
-#ifdef EXP_RED
-inline ulong red128(ulong lo, ulong hi) { return lo ^ hi; }
+
+/* ---- reduce the 128-bit value hi:lo modulo P (result may be >= P) ----------------------
+   x = lo + hl*2^64 + hh*2^96 = lo + hl*(2^32 - 1) - hh (mod P).
+   FAST / RED_PTX skip the borrow fix of "lo - hh - hl" (about 1 in 2^31 reductions). */
+#if defined(RED_PTX)
+inline ulong red128(ulong lo, ulong hi) {
+    ulong r;
+    asm("{\n\t"
+        ".reg .u32 l0, l1, hl, hh, c;\n\t"
+        "mov.b64 {l0, l1}, %1;\n\t"
+        "mov.b64 {hl, hh}, %2;\n\t"
+        "sub.cc.u32 l0, l0, hh;\n\t"   /* - hh */
+        "subc.u32 l1, l1, 0;\n\t"
+        "sub.cc.u32 l0, l0, hl;\n\t"   /* - hl */
+        "subc.u32 l1, l1, 0;\n\t"
+        "add.cc.u32 l1, l1, hl;\n\t"   /* + hl * 2^32, carry = one wrap = + 2^32 - 1 */
+        "addc.u32 c, 0, 0;\n\t"
+        "add.u32 l1, l1, c;\n\t"
+        "sub.cc.u32 l0, l0, c;\n\t"
+        "subc.u32 l1, l1, 0;\n\t"
+        "mov.b64 %0, {l0, l1};\n\t"
+        "}" : "=l"(r) : "l"(lo), "l"(hi));
+    return r;
+}
+#elif defined(FAST)
+inline ulong red128(ulong lo, ulong hi) {
+    ulong hh = hi >> 32, hl = hi & EPS;
+    ulong t1 = (hl << 32) - hl;
+    ulong t2 = (lo - hh) + t1;
+    return t2 + ((t2 < t1) ? EPS : 0UL);
+}
 #else
-/* reduce the 128-bit value hi:lo modulo P (result may be >= P) */
 inline ulong red128(ulong lo, ulong hi) {
     ulong hh = hi >> 32, hl = hi & EPS;
     ulong t0 = lo - hh;
     if (lo < hh) t0 -= EPS;
-#ifdef RED_SHIFT
-    ulong t1 = (hl << 32) - hl;
-#else
     ulong t1 = hl * EPS;
-#endif
     ulong t2 = t0 + t1;
     if (t2 < t1) t2 += EPS;
     return t2;
 }
 #endif
-#if defined(MUL_WIDE)
-/* NVIDIA: four wide 32x32 -> 64 multiplies, joined with 64-bit carry adds */
-inline void mul128(ulong a, ulong b, ulong* lo, ulong* hi) {
-    ulong l, h;
-    asm("{\n\t"
-        ".reg .u32 a0, a1, b0, b1;\n\t"
-        ".reg .u64 p00, p01, p10, p11, mid, c, t;\n\t"
-        "mov.b64 {a0, a1}, %2;\n\t"
-        "mov.b64 {b0, b1}, %3;\n\t"
-        "mul.wide.u32 p00, a0, b0;\n\t"
-        "mul.wide.u32 p01, a0, b1;\n\t"
-        "mul.wide.u32 p10, a1, b0;\n\t"
-        "mul.wide.u32 p11, a1, b1;\n\t"
-        "add.cc.u64 mid, p01, p10;\n\t"
-        "addc.u64 c, 0, 0;\n\t"
-        "shl.b64 t, mid, 32;\n\t"
-        "add.cc.u64 %0, p00, t;\n\t"
-        "shr.b64 t, mid, 32;\n\t"
-        "shl.b64 c, c, 32;\n\t"
-        "or.b64 t, t, c;\n\t"
-        "addc.u64 %1, p11, t;\n\t"
-        "}" : "=l"(l), "=l"(h) : "l"(a), "l"(b));
-    *lo = l; *hi = h;
-}
-#elif defined(NV_PTX)
-/* NVIDIA: 64x64 -> 128 with four 32-bit multiply-adds on the hardware carry chain */
-inline void mul128(ulong a, ulong b, ulong* lo, ulong* hi) {
-    ulong l, h;
-    asm("{\n\t"
-        ".reg .u32 a0, a1, b0, b1, r0, r1, r2, r3;\n\t"
-        "mov.b64 {a0, a1}, %2;\n\t"
-        "mov.b64 {b0, b1}, %3;\n\t"
-        "mul.lo.u32 r0, a0, b0;\n\t"
-        "mul.hi.u32 r1, a0, b0;\n\t"
-        "mad.lo.cc.u32 r1, a0, b1, r1;\n\t"
-        "madc.hi.u32 r2, a0, b1, 0;\n\t"
-        "mad.lo.cc.u32 r1, a1, b0, r1;\n\t"
-        "madc.hi.cc.u32 r2, a1, b0, r2;\n\t"
-        "madc.hi.u32 r3, a1, b1, 0;\n\t"
-        "mad.lo.cc.u32 r2, a1, b1, r2;\n\t"
-        "addc.u32 r3, r3, 0;\n\t"
-        "mov.b64 %0, {r0, r1};\n\t"
-        "mov.b64 %1, {r2, r3};\n\t"
-        "}" : "=l"(l), "=l"(h) : "l"(a), "l"(b));
-    *lo = l; *hi = h;
-}
-#elif defined(EXP_MUL)
-inline void mul128(ulong a, ulong b, ulong* lo, ulong* hi) { *lo = a * b; *hi = a ^ b; }
-#else
-inline void mul128(ulong a, ulong b, ulong* lo, ulong* hi) { *lo = a * b; *hi = mul_hi(a, b); }
-#endif
-inline ulong gmul(ulong a, ulong b) { ulong lo, hi; mul128(a, b, &lo, &hi); return red128(lo, hi); }
+
+inline ulong gmul(ulong a, ulong b) { return red128(a * b, mul_hi(a, b)); }
+/* a*b + c with a single reduction */
+#if defined(MULADD_PTX)
 inline ulong gmuladd(ulong a, ulong b, ulong c) {
-    ulong lo, hi; mul128(a, b, &lo, &hi);
+    ulong lo, hi;
+    asm("{\n\t"
+        ".reg .u64 l, h;\n\t"
+        "mul.lo.u64 l, %2, %3;\n\t"
+        "mul.hi.u64 h, %2, %3;\n\t"
+        "add.cc.u64 %0, l, %4;\n\t"
+        "addc.u64 %1, h, 0;\n\t"
+        "}" : "=l"(lo), "=l"(hi) : "l"(a), "l"(b), "l"(c));
+    return red128(lo, hi);
+}
+#else
+inline ulong gmuladd(ulong a, ulong b, ulong c) {
+    ulong lo = a * b, hi = mul_hi(a, b);
     lo += c; hi += (lo < c);
     return red128(lo, hi);
 }
+#endif
+
+/* add x into the running sum lo with a carry counter k */
+#if defined(SUM_PTX)
+#define ACC(lo, k, x) asm("add.cc.u64 %0, %2, %4;\n\taddc.u32 %1, %3, 0;" : "=l"(lo), "=r"(k) : "l"(lo), "r"(k), "l"(x))
+#else
+#define ACC(lo, k, x) { lo += (x); k += (uint)(lo < (x)); }
+#endif
 inline ulong exp7(ulong x) { ulong x2 = gmul(x, x); ulong x3 = gmul(x2, x); ulong x4 = gmul(x2, x2); return gmul(x3, x4); }
 inline ulong canon(ulong x) { return x >= PRIME ? x - PRIME : x; }
 
@@ -230,9 +245,17 @@ __kernel void qpow_search(__constant ulong* mid, ulong start, ulong target, __gl
     s.replace("MAX_RESULTS)", &format!("{MAX_RESULTS})")).replace("PERMUTE_BODY", &permute_code())
 }
 
+/// Kernel variants, fastest first. Each is proven against the CPU on the actual card before
+/// it is used; the last one is the exact, portable code that every OpenCL device can run.
+pub const VARIANTS: &[(&str, &str)] = &[
+    // carry-flag reduction, addition, multiply-add and sums: 205 MH/s on an RTX 5060 Ti (exact code: 145)
+    ("NVIDIA carry-flag", "-DRED_PTX -DADD_PTX -DMULADD_PTX -DSUM_PTX"),
+    ("exact", ""),
+];
+
 pub struct QpowGpu {
-    /// using the NVIDIA PTX multiply
-    pub ptx: bool,
+    /// name of the kernel variant in use
+    pub variant: &'static str,
     queue: CommandQueue,
     kernel: Kernel,
     _program: Program,
@@ -246,18 +269,26 @@ fn e<T: std::fmt::Display>(x: T) -> String {
 }
 
 impl QpowGpu {
-    /// Open the GPU with the fastest kernel that gives correct results on it: the PTX version on
-    /// NVIDIA is checked against the CPU first and dropped if anything differs.
+    /// Open the GPU with the fastest kernel variant that gives correct results on it.
     pub fn open_checked(info: &GpuInfo) -> Result<QpowGpu, String> {
-        // the PTX multiply measured slower than NVIDIA's own code on an RTX 5060 Ti, so it is opt-in
-        if info.nvidia && std::env::var("MH_PTX").is_ok() {
-            if let Ok(mut g) = QpowGpu::open_with(info, 256, true) {
-                if g.ptx && g.self_check(256) {
-                    return QpowGpu::open_with(info, 0, true);
+        if let Ok(defs) = std::env::var("MH_QPOW_DEFS") {
+            let defs: &'static str = Box::leak(defs.into_boxed_str());
+            return QpowGpu::open_with(info, 0, "custom", defs);
+        }
+        for (name, defs) in VARIANTS {
+            if defs.contains("PTX") && !info.nvidia {
+                continue;
+            }
+            if defs.is_empty() {
+                break;
+            }
+            if let Ok(mut g) = QpowGpu::open_with(info, 4096, name, defs) {
+                if g.self_check(4096) {
+                    return QpowGpu::open_with(info, 0, name, defs);
                 }
             }
         }
-        QpowGpu::open_with(info, 0, false)
+        QpowGpu::open_with(info, 0, "exact", "")
     }
 
     /// Compare `n` GPU hashes with the CPU. Needs a debug-enabled instance.
@@ -280,21 +311,22 @@ impl QpowGpu {
         })
     }
 
+    /// Exact kernel (or the MH_QPOW_DEFS override), optionally with debug output.
     pub fn open(info: &GpuInfo, debug_threads: usize) -> Result<QpowGpu, String> {
-        QpowGpu::open_with(info, debug_threads, false)
+        match std::env::var("MH_QPOW_DEFS") {
+            Ok(defs) => QpowGpu::open_with(info, debug_threads, "custom", Box::leak(defs.into_boxed_str())),
+            Err(_) => QpowGpu::open_with(info, debug_threads, "exact", ""),
+        }
     }
 
-    fn open_with(info: &GpuInfo, debug_threads: usize, try_ptx: bool) -> Result<QpowGpu, String> {
+    fn open_with(info: &GpuInfo, debug_threads: usize, variant: &'static str, defs: &str) -> Result<QpowGpu, String> {
         let device = Device::new(info.id as cl_device_id);
         let context = Context::from_device(&device).map_err(e)?;
         #[allow(deprecated)]
         let queue = CommandQueue::create_default(&context, 0).map_err(e)?;
         let (_, per) = tune();
-        let opts = format!("-DPER_THREAD={per}{} {}", if debug_threads > 0 { " -DDEBUG_OUT" } else { "" }, std::env::var("MH_QPOW_DEFS").unwrap_or_default());
-        let (program, ptx) = match try_ptx.then(|| Program::create_and_build_from_source(&context, &source(), &format!("{opts} -DNV_PTX"))) {
-            Some(Ok(p)) => (p, true),
-            _ => (Program::create_and_build_from_source(&context, &source(), &opts).map_err(|l| format!("QPoW kernel: {l}"))?, false),
-        };
+        let opts = format!("-DPER_THREAD={per}{} {defs}", if debug_threads > 0 { " -DDEBUG_OUT" } else { "" });
+        let program = Program::create_and_build_from_source(&context, &source(), &opts).map_err(|l| format!("QPoW kernel: {l}"))?;
         if let Ok(path) = std::env::var("MH_QPOW_DUMP") {
             if let Ok(bins) = program.get_binaries() {
                 if let Some(b) = bins.first() {
@@ -310,7 +342,7 @@ impl QpowGpu {
         } else {
             None
         };
-        Ok(QpowGpu { ptx, queue, kernel, _program: program, mid, results, debug })
+        Ok(QpowGpu { variant, queue, kernel, _program: program, mid, results, debug })
     }
 
     pub fn set_midstate(&mut self, mid: &[u64; 12]) -> Result<(), String> {

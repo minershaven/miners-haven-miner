@@ -1,4 +1,4 @@
-Miners Haven Miner 2.2  -  theminershaven.org
+Miners Haven Miner 2.3  -  theminershaven.org
 =============================================
 
 COINS

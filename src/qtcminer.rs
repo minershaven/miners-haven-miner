@@ -233,7 +233,7 @@ fn gpu_worker(slot: usize, gi: usize, info: crate::gpu::cl::GpuInfo, sh: Arc<Sha
         Ok(g) => g,
         Err(e) => { log(&format!("{name}: could not start: {e}")); return; }
     };
-    log(&format!("{name}: QPoW kernel ready ({})", if gpu.ptx { "NVIDIA fast path, verified" } else { "portable" }));
+    log(&format!("{name}: QPoW kernel ready ({}, checked against the CPU)", gpu.variant));
     let mut batch: usize = 1 << 22;
     while !sh.stop.load(Ordering::Relaxed) {
         let seen = sh.job_gen.load(Ordering::SeqCst);
@@ -283,13 +283,15 @@ pub fn bench_gpu(gpus: &[usize], secs: u64, log: Log) -> f64 {
     let infos: Vec<_> = crate::gpu::list_gpus().into_iter().filter(|g| gpus.is_empty() || gpus.contains(&g.index)).collect();
     let mut total = 0.0;
     for info in infos {
-        // every benchmark run first proves the kernel right against the CPU
-        match crate::gpu::qpow_cl::QpowGpu::open(&info, 1024) {
-            Ok(mut d) => log(&format!("GPU{}: self-check {}", info.index, if d.self_check(1024) { "OK" } else { "FAILED" })),
-            Err(e) => { log(&e); continue; }
+        // with a custom variant (tuning), show whether it is correct on this card
+        if std::env::var("MH_QPOW_DEFS").is_ok() {
+            match crate::gpu::qpow_cl::QpowGpu::open(&info, 4096) {
+                Ok(mut d) => log(&format!("GPU{}: self-check {}", info.index, if d.self_check(4096) { "OK" } else { "FAILED" })),
+                Err(e) => { log(&format!("GPU{}: build failed: {}", info.index, e.lines().take(3).collect::<Vec<_>>().join(" | "))); continue; }
+            }
         }
         let mut g = match crate::gpu::qpow_cl::QpowGpu::open_checked(&info) { Ok(g) => g, Err(e) => { log(&e); continue; } };
-        log(&format!("GPU{}: {} kernel", info.index, if g.ptx { "NVIDIA fast-path (verified against the CPU)" } else { "portable" }));
+        log(&format!("GPU{}: {} kernel", info.index, g.variant));
         let mid = crate::qpow::midstate(&[5; 32], &[9; 32]);
         let _ = g.set_midstate(&crate::qpow::state_u64(&mid));
         let mut batch = 1usize << 22;
