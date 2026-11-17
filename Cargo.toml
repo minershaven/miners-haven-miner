@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.8", features = ["derive"] }
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "clipboard", "links"] }
 hex = "0.4.3"
 num_cpus = "1.17.0"
 randomx-rs = "1.6.0"
