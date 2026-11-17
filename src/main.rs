@@ -24,6 +24,10 @@ struct Args {
     #[arg(long)]
     solo: bool,
 
+    /// Server location: auto (fastest), us or eu. The other one is used as a backup.
+    #[arg(long, default_value = "auto")]
+    region: String,
+
     /// Use a "large CPU / rental" port with a higher starting difficulty
     #[arg(long)]
     large: bool,
@@ -114,7 +118,11 @@ fn main() {
         std::process::exit(2);
     };
     let pools = if args.pool.is_empty() {
-        vec![engine::default_pool(coin.id, args.solo, args.large).unwrap()]
+        let region = engine::Region::parse(&args.region);
+        let (pe, pu) = engine::ping_regions(coin.id);
+        let ms = |p: Option<u32>| p.map(|v| format!("{v} ms")).unwrap_or_else(|| "-".into());
+        println!(" ping      EU {}   US {}", ms(pe), if coin.us { ms(pu) } else { "(not on US server)".into() });
+        engine::pool_list(coin.id, args.solo, args.large, region, Some((pe, pu)))
     } else {
         args.pool.clone()
     };

@@ -19,16 +19,28 @@ pub struct GpuInfo {
     pub memory: u64,
     pub max_alloc: u64,
     pub id: usize,
+    pub nvidia: bool,
+    pub pci_bus: Option<u32>,
+    /// position among the NVIDIA GPUs (to match NVML when the bus number is unknown)
+    pub nvidia_index: usize,
 }
 
 /// All OpenCL GPUs on this computer (empty if there's no OpenCL driver).
 pub fn list_gpus() -> Vec<GpuInfo> {
     let Ok(ids) = get_all_devices(CL_DEVICE_TYPE_GPU) else { return vec![] };
+    let mut nv_count = 0usize;
     ids.iter()
         .enumerate()
         .map(|(i, id)| {
             let d = Device::new(*id);
+            let vendor = d.vendor_id().unwrap_or(0);
+            let nvidia = vendor == 0x10de;
+            let pci_bus = if nvidia { d.pci_bus_id_nv().ok() } else if vendor == 0x1002 { d.topology_amd().ok().map(|t| t.bus as u32) } else { None };
+            let nvidia_index = if nvidia { nv_count += 1; nv_count - 1 } else { 0 };
             GpuInfo {
+                nvidia,
+                pci_bus,
+                nvidia_index,
                 index: i,
                 name: d.board_name_amd().ok().filter(|s| !s.is_empty()).or_else(|| d.name().ok()).unwrap_or_else(|| "GPU".into()).trim().to_string(),
                 memory: d.global_mem_size().unwrap_or(0),
@@ -228,7 +240,7 @@ mod tests {
             return;
         }
         let d = Device::new(gpus[0]);
-        let info = GpuInfo { index: 0, name: d.name().unwrap(), memory: d.global_mem_size().unwrap(), max_alloc: d.max_mem_alloc_size().unwrap(), id: gpus[0] as usize };
+        let info = GpuInfo { index: 0, name: d.name().unwrap(), memory: d.global_mem_size().unwrap(), max_alloc: d.max_mem_alloc_size().unwrap(), id: gpus[0] as usize, nvidia: false, pci_bus: None, nvidia_index: 0 };
         let mut light = Light::new(v, height / v.epoch_length);
         light.full_items = 4099; // tiny prime-sized DAG so the test is quick
         let mut gpu = Gpu::open(info).unwrap();

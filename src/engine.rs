@@ -46,16 +46,18 @@ pub struct Coin {
     pub algo: Algo,
     /// PPLNS port; SOLO is +10, the high-difficulty port +1
     pub port: u16,
+    /// also running on the US server
+    pub us: bool,
 }
 
 pub const COINS: &[Coin] = &[
-    Coin { id: "qrl", symbol: "QRL", name: "QRL", algo: Algo::RandomX, port: 3181 },
-    Coin { id: "xmr", symbol: "XMR", name: "Monero", algo: Algo::RandomX, port: 3141 },
-    Coin { id: "qtc", symbol: "QTC", name: "Quantus", algo: Algo::QPow, port: 3101 },
-    Coin { id: "neox", symbol: "NEOX", name: "Neoxa", algo: Algo::KawPow, port: 3081 },
-    Coin { id: "abrs", symbol: "ABRS", name: "Aurora Borealis", algo: Algo::KawPow, port: 3161 },
-    Coin { id: "firo", symbol: "FIRO", name: "Firo", algo: Algo::FiroPow, port: 3121 },
-    Coin { id: "zano", symbol: "ZANO", name: "Zano", algo: Algo::ProgPowZ, port: 3061 },
+    Coin { id: "qrl", symbol: "QRL", name: "QRL", algo: Algo::RandomX, port: 3181, us: false },
+    Coin { id: "xmr", symbol: "XMR", name: "Monero", algo: Algo::RandomX, port: 3141, us: true },
+    Coin { id: "qtc", symbol: "QTC", name: "Quantus", algo: Algo::QPow, port: 3101, us: true },
+    Coin { id: "neox", symbol: "NEOX", name: "Neoxa", algo: Algo::KawPow, port: 3081, us: true },
+    Coin { id: "abrs", symbol: "ABRS", name: "Aurora Borealis", algo: Algo::KawPow, port: 3161, us: false },
+    Coin { id: "firo", symbol: "FIRO", name: "Firo", algo: Algo::FiroPow, port: 3121, us: true },
+    Coin { id: "zano", symbol: "ZANO", name: "Zano", algo: Algo::ProgPowZ, port: 3061, us: true },
 ];
 
 pub fn coin(id: &str) -> Option<&'static Coin> {
@@ -67,6 +69,82 @@ pub fn coin(id: &str) -> Option<&'static Coin> {
 pub fn default_pool(coin_id: &str, solo: bool, large: bool) -> Option<String> {
     let c = coin(coin_id)?;
     Some(format!("{POOL_HOST}:{}", c.port + if solo { 10 } else { 0 } + if large { 1 } else { 0 }))
+}
+
+/// Where to mine. Both servers share one database, so balances and stats are the same either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    /// whichever answers fastest
+    Auto,
+    Eu,
+    Us,
+}
+
+pub const HOST_EU: &str = "theminershaven.org";
+pub const HOST_US: &str = "us.theminershaven.org";
+
+impl Region {
+    pub fn parse(s: &str) -> Region {
+        match s.to_lowercase().as_str() {
+            "eu" | "europe" | "de" => Region::Eu,
+            "us" | "usa" | "na" => Region::Us,
+            _ => Region::Auto,
+        }
+    }
+    pub fn id(self) -> &'static str {
+        match self {
+            Region::Auto => "auto",
+            Region::Eu => "eu",
+            Region::Us => "us",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Region::Auto => "Auto (fastest)",
+            Region::Eu => "EU - Germany",
+            Region::Us => "US - St. Louis",
+        }
+    }
+}
+
+/// Round trip of a TCP connect to host:port, in milliseconds.
+pub fn ping(host: &str, port: u16) -> Option<u32> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let addr = (host, port).to_socket_addrs().ok()?.next()?;
+    let t = Instant::now();
+    TcpStream::connect_timeout(&addr, Duration::from_secs(3)).ok()?;
+    Some(t.elapsed().as_millis() as u32)
+}
+
+/// (EU ms, US ms) to this coin's pool port; None where it isn't reachable or doesn't run.
+pub fn ping_regions(coin_id: &str) -> (Option<u32>, Option<u32>) {
+    let Some(c) = coin(coin_id) else { return (None, None) };
+    let us = if c.us { std::thread::spawn({ let p = c.port; move || ping(HOST_US, p) }) } else { std::thread::spawn(|| None) };
+    let eu = ping(HOST_EU, c.port);
+    (eu, us.join().unwrap_or(None))
+}
+
+/// Miners Haven pools to use, best first: the chosen location, then the other one as a backup.
+/// `pings` lets the caller pass measurements it already has (for Auto).
+pub fn pool_list(coin_id: &str, solo: bool, large: bool, region: Region, pings: Option<(Option<u32>, Option<u32>)>) -> Vec<String> {
+    let Some(c) = coin(coin_id) else { return vec![] };
+    let solo_off = if solo { 10 } else { 0 };
+    let eu = format!("{HOST_EU}:{}", c.port + solo_off + if large { 1 } else { 0 });
+    // the US server has no high-difficulty ports; its normal port uses vardiff
+    let us = format!("{HOST_US}:{}", c.port + solo_off);
+    if !c.us {
+        return vec![eu];
+    }
+    let us_first = match region {
+        Region::Eu => false,
+        Region::Us => true,
+        Region::Auto => match pings.unwrap_or_else(|| ping_regions(coin_id)) {
+            (Some(e), Some(u)) => u < e,
+            (None, Some(_)) => true,
+            _ => false,
+        },
+    };
+    if us_first { vec![us, eu] } else { vec![eu, us] }
 }
 
 /// Pool id on theminershaven.org (for the stats page link).
@@ -111,6 +189,8 @@ pub struct Stats {
     pub devices: Mutex<Vec<String>>,
     /// share difficulty as the pool states it (set by backends whose difficulty isn't a whole number)
     pub diff_text: Mutex<String>,
+    /// hottest GPU in °C (0 = unknown / not a GPU coin)
+    pub gpu_temp: AtomicU64,
     pub started: Instant,
 }
 
@@ -129,6 +209,7 @@ impl Stats {
             history: Mutex::new(VecDeque::new()),
             devices: Mutex::new(Vec::new()),
             diff_text: Mutex::new(String::new()),
+            gpu_temp: AtomicU64::new(0),
             started: Instant::now(),
         }
     }
@@ -225,6 +306,9 @@ impl Engine {
                     if n % 60 == 0 {
                         lg(&format!("speed {}  accepted {}  rejected {}", hr(*st.hashrate.lock().unwrap()),
                             st.accepted.load(Ordering::Relaxed), st.rejected.load(Ordering::Relaxed)));
+                        for d in st.devices.lock().unwrap().iter() {
+                            lg(&format!("  {d}"));
+                        }
                     }
                 }
             });

@@ -6,6 +6,7 @@ pub mod cl;
 pub mod kernel;
 pub mod pool;
 pub mod progpow;
+pub mod sensors;
 
 use crate::engine::{hr, spawn_meter, Algo, Backend, Config, Log, Stats};
 use cl::{Gpu, GpuInfo};
@@ -36,6 +37,7 @@ struct Shared {
     rates: Vec<Mutex<f64>>,
     light: Mutex<Option<Arc<Light>>>,
     names: Vec<String>,
+    infos: Vec<GpuInfo>,
 }
 
 impl Shared {
@@ -100,6 +102,7 @@ pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
         rates: gpus.iter().map(|_| Mutex::new(0.0)).collect(),
         light: Mutex::new(None),
         names: gpus.iter().map(|g| format!("GPU{} {}", g.index, g.name)).collect(),
+        infos: gpus.clone(),
     });
     let proto = if cfg.algo == Algo::ProgPowZ { Proto::EthProxy } else { Proto::Stratum };
     let client = PoolClient::new(proto);
@@ -134,7 +137,9 @@ pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
     {
         let (sh, st, lg) = (shared.clone(), stats.clone(), log.clone());
         handles.push(std::thread::spawn(move || {
+            let sensors = sensors::Sensors::new();
             let mut last_dev = Instant::now();
+            let mut last_hot = Instant::now() - Duration::from_secs(600);
             while !sh.stop.load(Ordering::SeqCst) {
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(PoolMsg::Job(job)) => {
@@ -159,7 +164,19 @@ pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
                 }
                 if last_dev.elapsed() > Duration::from_secs(2) {
                     last_dev = Instant::now();
-                    *st.devices.lock().unwrap() = sh.names.iter().zip(&sh.rates).map(|(n, r)| format!("{n}   {}", hr(*r.lock().unwrap()))).collect();
+                    let mut lines = Vec::new();
+                    let mut hottest = 0u32;
+                    for ((n, r), g) in sh.names.iter().zip(&sh.rates).zip(&sh.infos) {
+                        let rd = sensors.read(g.nvidia, g.pci_bus, g.nvidia_index);
+                        hottest = hottest.max(rd.temp_c.unwrap_or(0));
+                        lines.push(format!("{n}   {:>11}   {}", hr(*r.lock().unwrap()), rd.text()));
+                        if rd.temp_c.unwrap_or(0) >= 85 && last_hot.elapsed() > Duration::from_secs(300) {
+                            last_hot = Instant::now();
+                            lg(&format!("{n} is running hot ({}°C) - check its fans and airflow", rd.temp_c.unwrap()));
+                        }
+                    }
+                    st.gpu_temp.store(hottest as u64, Ordering::Relaxed);
+                    *st.devices.lock().unwrap() = lines;
                 }
             }
         }));

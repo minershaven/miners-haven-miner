@@ -49,6 +49,8 @@ struct Settings {
     other_pass: String,
     /// GPU indexes to mine with (empty = all)
     gpus: Vec<usize>,
+    /// "auto", "us" or "eu"
+    region: String,
 }
 
 impl Default for Settings {
@@ -70,6 +72,7 @@ impl Default for Settings {
             other_user: String::new(),
             other_pass: String::new(),
             gpus: Vec::new(),
+            region: "auto".into(),
         }
     }
 }
@@ -142,6 +145,9 @@ struct App {
     hp: Status,
     cores: usize,
     gpus: Vec<mhminer::gpu::cl::GpuInfo>,
+    /// last ping results: (coin id, EU ms, US ms)
+    pings: Arc<Mutex<Option<(String, Option<u32>, Option<u32>)>>>,
+    ping_coin: String,
     error: Option<String>,
 }
 
@@ -157,6 +163,8 @@ impl App {
             hp,
             cores: num_cpus::get(),
             gpus: mhminer::gpu::list_gpus(),
+            pings: Arc::new(Mutex::new(None)),
+            ping_coin: String::new(),
             error: None,
         };
         app.s.threads = app.s.threads.clamp(1, app.cores);
@@ -219,7 +227,9 @@ impl App {
                 return;
             }
             let login = if worker.is_empty() { wallet } else { format!("{wallet}.{worker}") };
-            (engine::default_pool(&self.s.coin, self.s.solo, self.s.large).into_iter().collect(), login, "x".into())
+            let pings = self.pings.lock().unwrap().clone().filter(|p| p.0 == self.s.coin).map(|p| (p.1, p.2));
+            let pools = engine::pool_list(&self.s.coin, self.s.solo, self.s.large, engine::Region::parse(&self.s.region), pings);
+            (pools, login, "x".into())
         };
         if self.s.coin().algo.gpu() && self.gpus.is_empty() {
             self.error = Some(format!("{} is mined on a graphics card, and no OpenCL GPU was found. Install the latest NVIDIA or AMD driver.", self.s.coin().symbol));
@@ -311,6 +321,16 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         ctx.request_repaint_after(Duration::from_millis(500));
+        // measure EU / US latency for the selected coin in the background
+        if self.ping_coin != self.s.coin {
+            self.ping_coin = self.s.coin.clone();
+            let (coin, out, c2) = (self.s.coin.clone(), self.pings.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let (e, u) = engine::ping_regions(&coin);
+                *out.lock().unwrap() = Some((coin, e, u));
+                c2.request_repaint();
+            });
+        }
         let running = self.running();
 
         // ---------- header ----------
@@ -434,6 +454,36 @@ impl App {
         if self.s.other() {
             self.other_pool_ui(ui);
         } else {
+            section(ui, "Location");
+            let c = self.s.coin();
+            let pings = self.pings.lock().unwrap().clone().filter(|p| p.0 == c.id);
+            let ms = |v: Option<u32>| v.map(|x| format!("{x} ms")).unwrap_or_else(|| if pings.is_some() { "offline".into() } else { "...".into() });
+            let (pe, pu) = pings.as_ref().map(|p| (p.1, p.2)).unwrap_or((None, None));
+            ui.horizontal(|ui| {
+                for (id, name, sub, enabled) in [
+                    ("auto", "Auto", "fastest".to_string(), true),
+                    ("us", "US", if c.us { ms(pu) } else { "n/a".into() }, c.us),
+                    ("eu", "EU", ms(pe), true),
+                ] {
+                    let sel = self.s.region == id || (id == "eu" && self.s.region == "us" && !c.us);
+                    let txt = RichText::new(format!("{name}\n{sub}")).size(12.5).color(if sel { Color32::WHITE } else { TEXT });
+                    let b = egui::Button::new(txt).fill(if sel { ACCENT_FILL } else { RAISED }).min_size(egui::vec2(92.0, 40.0));
+                    if ui.add_enabled(enabled, b).clicked() {
+                        self.s.region = id.into();
+                    }
+                }
+            });
+            let note = if !c.us {
+                format!("{} runs on the EU server only.", c.symbol)
+            } else {
+                match self.s.region.as_str() {
+                    "us" => "US - St. Louis, with EU as backup.".to_string(),
+                    "eu" => "EU - Germany, with US as backup.".to_string(),
+                    _ => "Picks the closer server, the other one is the backup.".to_string(),
+                }
+            };
+            ui.label(RichText::new(note).size(11.0).color(MUTED));
+
             section(ui, "Payout");
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.s.solo, false, "PPLNS (steady payouts)");
@@ -579,7 +629,9 @@ impl App {
             card(&mut c[0], "Block height", dash(height), TEXT);
             card(&mut c[1], "Uptime", if self.running() { uptime(up) } else { "-".into() }, TEXT);
             if gpu_coin {
-                card(&mut c[2], "Graphics cards", if devices.is_empty() { "-".into() } else { devices.len().to_string() }, TEXT);
+                let t = self.engine.as_ref().map(|e| e.stats.gpu_temp.load(Ordering::Relaxed)).unwrap_or(0);
+                let col = if t == 0 { MUTED } else if t >= 85 { RED } else if t >= 75 { WARN } else { GREEN };
+                card(&mut c[2], "GPU temp", if t == 0 { "-".into() } else { format!("{t}°C") }, col);
             } else {
                 card(&mut c[2], "Huge pages", if !self.running() { "-".into() } else if huge { "On".into() } else { "Off".into() },
                     if huge { GREEN } else { MUTED });
