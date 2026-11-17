@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use mhminer::engine::{self, hr, Config, Engine, Log};
-use mhminer::{hugepages, qtcminer, rx, rxminer};
+use mhminer::{gpu, hugepages, qtcminer, rx, rxminer};
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -43,6 +43,10 @@ struct Args {
     /// Mining threads (default: one per CPU core, minus one when you have more than 4)
     #[arg(long, short = 't')]
     threads: Option<usize>,
+
+    /// GPUs to use for GPU coins, e.g. --gpu 0 --gpu 1 (default: all)
+    #[arg(long = "gpu")]
+    gpus: Vec<usize>,
 
     /// Light mode: 256 MB instead of 2 GB RAM, but several times slower
     #[arg(long)]
@@ -94,7 +98,13 @@ fn main() {
                 let rate = qtcminer::bench(threads, secs);
                 println!(" benchmark QPoW: {} with {threads} threads", hr(rate));
             }
-            a => println!(" benchmark for {} is not available yet", a.name()),
+            a => {
+                for g in gpu::list_gpus() {
+                    println!(" GPU{}  {}  {:.1} GB", g.index, g.name, g.memory as f64 / 1073741824.0);
+                }
+                let rate = gpu::bench(a, &args.gpus, secs, log);
+                println!(" benchmark {}: {}", a.name(), hr(rate));
+            }
         }
         return;
     }
@@ -121,7 +131,7 @@ fn main() {
         None if args.pool.is_empty() => format!("{wallet}.{}", args.worker),
         None => wallet.clone(),
     };
-    let cfg = Config { algo: coin.algo, pools, login, pass: args.pass.clone(), threads, light: args.light, gpus: vec![] };
+    let cfg = Config { algo: coin.algo, pools, login, pass: args.pass.clone(), threads, light: args.light, gpus: args.gpus.clone() };
     let _engine = Engine::start(cfg, log);
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));

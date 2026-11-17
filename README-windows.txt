@@ -1,24 +1,32 @@
-Miners Haven Miner 0.1  -  theminershaven.org
+Miners Haven Miner 0.2  -  theminershaven.org
 =============================================
 
-DESKTOP APP
-  Double-click MinersHavenMiner.exe. Pick QRL or Monero, paste your wallet address,
-  choose how many CPU threads to use and press START MINING. Settings are remembered.
+COINS
+  On your processor (CPU):    QRL, XMR (RandomX)   QTC (QPoW)
+  On your graphics card (GPU): NEOX, ABRS (KawPoW)  FIRO (FiroPoW)  ZANO (ProgPowZ)
+  GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
 
-  Huge pages (about 10-20% faster): right-click MinersHavenMiner.exe > Run as administrator
-  (or press "Restart as administrator" in the app). The first time, it gives your Windows
-  account the "Lock pages in memory" permission; sign out of Windows and back in (or restart)
-  once, then run it as administrator again and "Huge pages" shows On.
+DESKTOP APP
+  Double-click MinersHavenMiner.exe. Pick a coin, paste your wallet address and press
+  START MINING. For GPU coins, tick the graphics cards to use. Settings are remembered.
+  Pool: "Miners Haven" picks the right port for you; "Other pool" mines anywhere.
+
+  Huge pages (RandomX only, about 10-20% faster): right-click MinersHavenMiner.exe >
+  Run as administrator (or press "Restart as administrator" in the app). The first time,
+  sign out of Windows and back in (or restart) once afterwards.
 
 COMMAND LINE (mhminer.exe)
-  1. Double-click SELFTEST-AND-BENCHMARK.bat to check your PC and see your hashrate.
-  2. Right-click START-QRL.bat (or START-XMR.bat) > Edit, replace YOUR_QRL_ADDRESS with your
-     wallet address, save, then double-click it to start mining.
+  mhminer.exe --coin neox --wallet YOUR_ADDRESS --worker rig1
+  mhminer.exe --coin zano --bench 20        (GPU speed test)
+  mhminer.exe --coin xmr --bench 20         (CPU speed test)
 
-  Options (add them to the line in the .bat file):
+  Options:
+    --coin X      qrl, xmr, qtc, neox, abrs, firo, zano
     --solo        mine SOLO instead of PPLNS
-    --threads 4   use a set number of CPU threads
-    --light       use 256 MB of RAM instead of 2 GB (slower)
-    --large       high-difficulty port for big CPUs / rentals
+    --large       high-difficulty port for big rigs / rentals
+    --threads 4   CPU threads (CPU coins)
+    --gpu 0       which graphics card(s) to use (GPU coins; repeat for more)
+    --pool HOST:PORT   another pool (stratum+ssl://HOST:PORT for SSL)
+    --user / --pass    login and password for other pools
 
 Windows Defender may warn about a crypto miner; that is expected for an unsigned miner.

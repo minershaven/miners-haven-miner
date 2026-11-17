@@ -47,6 +47,8 @@ struct Settings {
     other_pool: String,
     other_user: String,
     other_pass: String,
+    /// GPU indexes to mine with (empty = all)
+    gpus: Vec<usize>,
 }
 
 impl Default for Settings {
@@ -67,6 +69,7 @@ impl Default for Settings {
             other_pool: String::new(),
             other_user: String::new(),
             other_pass: String::new(),
+            gpus: Vec::new(),
         }
     }
 }
@@ -138,6 +141,7 @@ struct App {
     logs: Arc<Mutex<VecDeque<String>>>,
     hp: Status,
     cores: usize,
+    gpus: Vec<mhminer::gpu::cl::GpuInfo>,
     error: Option<String>,
 }
 
@@ -152,11 +156,18 @@ impl App {
             logs,
             hp,
             cores: num_cpus::get(),
+            gpus: mhminer::gpu::list_gpus(),
             error: None,
         };
         app.s.threads = app.s.threads.clamp(1, app.cores);
         app.log(&format!("Miners Haven Miner {} ready - {} CPU threads", env!("CARGO_PKG_VERSION"), app.cores));
         app.log(hp.describe());
+        for g in &app.gpus {
+            app.log(&format!("GPU{}  {}  ({:.1} GB)", g.index, g.name, g.memory as f64 / 1073741824.0));
+        }
+        if app.gpus.is_empty() {
+            app.log("no OpenCL graphics card found (GPU coins need an NVIDIA or AMD driver)");
+        }
         let autostart = std::env::args().any(|a| a == "--autostart");
         if autostart || app.s.start_on_open {
             app.start();
@@ -210,7 +221,12 @@ impl App {
             let login = if worker.is_empty() { wallet } else { format!("{wallet}.{worker}") };
             (engine::default_pool(&self.s.coin, self.s.solo, self.s.large).into_iter().collect(), login, "x".into())
         };
-        let cfg = Config { algo: self.s.coin().algo, pools: pools.clone(), login, pass, threads: self.s.threads, light: self.s.light, gpus: vec![] };
+        if self.s.coin().algo.gpu() && self.gpus.is_empty() {
+            self.error = Some(format!("{} is mined on a graphics card, and no OpenCL GPU was found. Install the latest NVIDIA or AMD driver.", self.s.coin().symbol));
+            return;
+        }
+        let gpus: Vec<usize> = self.s.gpus.iter().copied().filter(|i| self.gpus.iter().any(|g| g.index == *i)).collect();
+        let cfg = Config { algo: self.s.coin().algo, pools: pools.clone(), login, pass, threads: self.s.threads, light: self.s.light, gpus };
         self.s.save();
         let what = if self.s.other() { "other pool".to_string() } else { if self.s.solo { "SOLO" } else { "PPLNS" }.to_string() };
         let c = self.s.coin();
@@ -435,6 +451,21 @@ impl App {
         if !self.s.coin().algo.gpu() {
             section(ui, &format!("CPU threads  ({} available)", self.cores));
             ui.add(egui::Slider::new(&mut self.s.threads, 1..=self.cores));
+        } else {
+            section(ui, "Graphics cards");
+            if self.gpus.is_empty() {
+                ui.label(RichText::new("No OpenCL GPU found - install the latest NVIDIA or AMD driver.").color(WARN));
+            }
+            for g in self.gpus.clone() {
+                let mut on = self.s.gpus.is_empty() || self.s.gpus.contains(&g.index);
+                if ui.checkbox(&mut on, format!("GPU{}  {}  ({:.0} GB)", g.index, g.name, g.memory as f64 / 1073741824.0)).changed() {
+                    let mut sel: Vec<usize> = if self.s.gpus.is_empty() { self.gpus.iter().map(|x| x.index).collect() } else { self.s.gpus.clone() };
+                    if on { if !sel.contains(&g.index) { sel.push(g.index); } } else { sel.retain(|x| *x != g.index); }
+                    sel.sort();
+                    // all selected is stored as "all", so new cards get used too
+                    self.s.gpus = if sel.len() == self.gpus.len() { vec![] } else { sel };
+                }
+            }
         }
 
         ui.add_space(4.0);
@@ -531,24 +562,36 @@ impl App {
             None => (0.0, 0, 0, 0, 0, Duration::ZERO, false, String::new(), false),
         };
         let dash = |v: u64| if v == 0 { "-".to_string() } else { v.to_string() };
+        let (diff_text, devices) = match &self.engine {
+            Some(e) => (e.stats.diff_text.lock().unwrap().clone(), e.stats.devices.lock().unwrap().clone()),
+            None => (String::new(), vec![]),
+        };
+        let gpu_coin = self.s.coin().algo.gpu();
 
         ui.columns(4, |c| {
             card(&mut c[0], "Hashrate", hr(rate), ACCENT);
             card(&mut c[1], "Accepted", acc.to_string(), GREEN);
             card(&mut c[2], "Rejected", rej.to_string(), if rej > 0 { RED } else { TEXT });
-            card(&mut c[3], "Share diff", dash(diff), TEXT);
+            card(&mut c[3], "Share diff", if diff_text.is_empty() { dash(diff) } else { diff_text.clone() }, TEXT);
         });
         ui.add_space(4.0);
         ui.columns(4, |c| {
             card(&mut c[0], "Block height", dash(height), TEXT);
             card(&mut c[1], "Uptime", if self.running() { uptime(up) } else { "-".into() }, TEXT);
-            card(&mut c[2], "Huge pages", if !self.running() { "-".into() } else if huge { "On".into() } else { "Off".into() },
-                if huge { GREEN } else { MUTED });
+            if gpu_coin {
+                card(&mut c[2], "Graphics cards", if devices.is_empty() { "-".into() } else { devices.len().to_string() }, TEXT);
+            } else {
+                card(&mut c[2], "Huge pages", if !self.running() { "-".into() } else if huge { "On".into() } else { "Off".into() },
+                    if huge { GREEN } else { MUTED });
+            }
             card(&mut c[3], "Pool", if conn { "Connected".into() } else if self.running() { "Connecting".into() } else { "-".into() },
                 if conn { GREEN } else { MUTED });
         });
         if conn {
             ui.label(RichText::new(pool).size(11.0).color(MUTED));
+        }
+        for d in &devices {
+            ui.label(RichText::new(d).monospace().size(12.0).color(TEXT));
         }
 
         // hashrate chart
@@ -613,7 +656,7 @@ impl App {
                     for l in logs.iter() {
                         let col = if l.contains("accepted") { GREEN } else if l.contains("rejected") || l.contains("lost") || l.contains("could not") {
                             RED
-                        } else if l.contains("huge pages") { WARN } else { Color32::from_rgb(0xb8, 0xc2, 0xd6) };
+                        } else if l.contains("huge pages") || l.contains("DAG") || l.contains("epoch") { WARN } else { Color32::from_rgb(0xb8, 0xc2, 0xd6) };
                         ui.label(RichText::new(l).monospace().size(12.0).color(col));
                     }
                 });

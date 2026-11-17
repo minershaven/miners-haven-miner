@@ -109,6 +109,8 @@ pub struct Stats {
     pub history: Mutex<VecDeque<f64>>,
     /// per-device lines for the GPU backend, e.g. "GPU0 RTX 5060 Ti  31.2 MH/s  61C"
     pub devices: Mutex<Vec<String>>,
+    /// share difficulty as the pool states it (set by backends whose difficulty isn't a whole number)
+    pub diff_text: Mutex<String>,
     pub started: Instant,
 }
 
@@ -126,6 +128,7 @@ impl Stats {
             hashrate: Mutex::new(0.0),
             history: Mutex::new(VecDeque::new()),
             devices: Mutex::new(Vec::new()),
+            diff_text: Mutex::new(String::new()),
             started: Instant::now(),
         }
     }

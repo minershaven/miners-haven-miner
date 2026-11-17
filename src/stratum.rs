@@ -60,7 +60,7 @@ pub fn parse_pool(s: &str) -> Result<PoolAddr, String> {
     Ok(PoolAddr { host: host.trim_matches(['[', ']']).to_string(), port, tls })
 }
 
-trait Duplex: Read + Write + Send {}
+pub(crate) trait Duplex: Read + Write + Send {}
 impl<T: Read + Write + Send> Duplex for T {}
 
 /// Mining pools almost always use self-signed certificates, so (like XMRig) the connection is
@@ -119,7 +119,7 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
     .clone()
 }
 
-fn open(pool: &PoolAddr) -> Result<Box<dyn Duplex>, String> {
+pub(crate) fn open(pool: &PoolAddr) -> Result<Box<dyn Duplex>, String> {
     let addr = (pool.host.as_str(), pool.port).to_socket_addrs().map_err(|e| format!("can't resolve {}: {e}", pool.host))?
         .next().ok_or("could not resolve pool address")?;
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(15)).map_err(|e| e.to_string())?;

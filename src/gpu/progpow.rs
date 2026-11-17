@@ -561,4 +561,6 @@ mod tests {
     fn firopow() { check(FIROPOW, "firopow.json", 1_100_000); }
     #[test]
     fn progpowz() { check(PROGPOWZ, "progpowz.json", 3_000_000); }
+    #[test]
+    fn firopow_live() { check(FIROPOW, "firopow3.json", 1_413_881); }
 }
