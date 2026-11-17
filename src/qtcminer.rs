@@ -283,6 +283,11 @@ pub fn bench_gpu(gpus: &[usize], secs: u64, log: Log) -> f64 {
     let infos: Vec<_> = crate::gpu::list_gpus().into_iter().filter(|g| gpus.is_empty() || gpus.contains(&g.index)).collect();
     let mut total = 0.0;
     for info in infos {
+        // every benchmark run first proves the kernel right against the CPU
+        match crate::gpu::qpow_cl::QpowGpu::open(&info, 1024) {
+            Ok(mut d) => log(&format!("GPU{}: self-check {}", info.index, if d.self_check(1024) { "OK" } else { "FAILED" })),
+            Err(e) => { log(&e); continue; }
+        }
         let mut g = match crate::gpu::qpow_cl::QpowGpu::open_checked(&info) { Ok(g) => g, Err(e) => { log(&e); continue; } };
         log(&format!("GPU{}: {} kernel", info.index, if g.ptx { "NVIDIA fast-path (verified against the CPU)" } else { "portable" }));
         let mid = crate::qpow::midstate(&[5; 32], &[9; 32]);

@@ -73,22 +73,58 @@ pub fn source() -> String {
 #define EPS 0xFFFFFFFFUL
 #define PRIME 0xFFFFFFFF00000001UL
 
+#ifdef EXP_ADD
+inline ulong gadd(ulong a, ulong b) { return a + b; }
+#else
 inline ulong gadd(ulong a, ulong b) {
     ulong s = a + b;
     if (s < a) { ulong t = s + EPS; if (t < s) t += EPS; s = t; }
     return s;
 }
+#endif
+#ifdef EXP_RED
+inline ulong red128(ulong lo, ulong hi) { return lo ^ hi; }
+#else
 /* reduce the 128-bit value hi:lo modulo P (result may be >= P) */
 inline ulong red128(ulong lo, ulong hi) {
     ulong hh = hi >> 32, hl = hi & EPS;
     ulong t0 = lo - hh;
     if (lo < hh) t0 -= EPS;
+#ifdef RED_SHIFT
+    ulong t1 = (hl << 32) - hl;
+#else
     ulong t1 = hl * EPS;
+#endif
     ulong t2 = t0 + t1;
     if (t2 < t1) t2 += EPS;
     return t2;
 }
-#ifdef NV_PTX
+#endif
+#if defined(MUL_WIDE)
+/* NVIDIA: four wide 32x32 -> 64 multiplies, joined with 64-bit carry adds */
+inline void mul128(ulong a, ulong b, ulong* lo, ulong* hi) {
+    ulong l, h;
+    asm("{\n\t"
+        ".reg .u32 a0, a1, b0, b1;\n\t"
+        ".reg .u64 p00, p01, p10, p11, mid, c, t;\n\t"
+        "mov.b64 {a0, a1}, %2;\n\t"
+        "mov.b64 {b0, b1}, %3;\n\t"
+        "mul.wide.u32 p00, a0, b0;\n\t"
+        "mul.wide.u32 p01, a0, b1;\n\t"
+        "mul.wide.u32 p10, a1, b0;\n\t"
+        "mul.wide.u32 p11, a1, b1;\n\t"
+        "add.cc.u64 mid, p01, p10;\n\t"
+        "addc.u64 c, 0, 0;\n\t"
+        "shl.b64 t, mid, 32;\n\t"
+        "add.cc.u64 %0, p00, t;\n\t"
+        "shr.b64 t, mid, 32;\n\t"
+        "shl.b64 c, c, 32;\n\t"
+        "or.b64 t, t, c;\n\t"
+        "addc.u64 %1, p11, t;\n\t"
+        "}" : "=l"(l), "=l"(h) : "l"(a), "l"(b));
+    *lo = l; *hi = h;
+}
+#elif defined(NV_PTX)
 /* NVIDIA: 64x64 -> 128 with four 32-bit multiply-adds on the hardware carry chain */
 inline void mul128(ulong a, ulong b, ulong* lo, ulong* hi) {
     ulong l, h;
@@ -110,6 +146,8 @@ inline void mul128(ulong a, ulong b, ulong* lo, ulong* hi) {
         "}" : "=l"(l), "=l"(h) : "l"(a), "l"(b));
     *lo = l; *hi = h;
 }
+#elif defined(EXP_MUL)
+inline void mul128(ulong a, ulong b, ulong* lo, ulong* hi) { *lo = a * b; *hi = a ^ b; }
 #else
 inline void mul128(ulong a, ulong b, ulong* lo, ulong* hi) { *lo = a * b; *hi = mul_hi(a, b); }
 #endif
@@ -252,11 +290,18 @@ impl QpowGpu {
         #[allow(deprecated)]
         let queue = CommandQueue::create_default(&context, 0).map_err(e)?;
         let (_, per) = tune();
-        let opts = format!("-DPER_THREAD={per}{}", if debug_threads > 0 { " -DDEBUG_OUT" } else { "" });
+        let opts = format!("-DPER_THREAD={per}{} {}", if debug_threads > 0 { " -DDEBUG_OUT" } else { "" }, std::env::var("MH_QPOW_DEFS").unwrap_or_default());
         let (program, ptx) = match try_ptx.then(|| Program::create_and_build_from_source(&context, &source(), &format!("{opts} -DNV_PTX"))) {
             Some(Ok(p)) => (p, true),
             _ => (Program::create_and_build_from_source(&context, &source(), &opts).map_err(|l| format!("QPoW kernel: {l}"))?, false),
         };
+        if let Ok(path) = std::env::var("MH_QPOW_DUMP") {
+            if let Ok(bins) = program.get_binaries() {
+                if let Some(b) = bins.first() {
+                    let _ = std::fs::write(&path, b);
+                }
+            }
+        }
         let kernel = Kernel::create(&program, "qpow_search").map_err(e)?;
         let mid = unsafe { Buffer::<cl_ulong>::create(&context, CL_MEM_READ_ONLY, 12, ptr::null_mut()).map_err(e)? };
         let results = unsafe { Buffer::<cl_uint>::create(&context, CL_MEM_READ_WRITE, 1 + 2 * MAX_RESULTS, ptr::null_mut()).map_err(e)? };

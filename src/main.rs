@@ -106,7 +106,7 @@ fn main() {
             }
             engine::Algo::QPow => {
                 let g = gpu::bench_qpow(&args.gpus, secs, log.clone());
-                let rate = qtcminer::bench(threads, secs);
+                let rate = if args.threads == Some(0) { 0.0 } else { qtcminer::bench(threads.max(1), secs) };
                 println!(" benchmark QPoW: CPU {} with {threads} threads, GPU {}", hr(rate), hr(g));
             }
             a => {
