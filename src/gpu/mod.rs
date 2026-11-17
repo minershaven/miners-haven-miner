@@ -1,5 +1,7 @@
 //! GPU backend for the ProgPoW family (KawPoW, FiroPoW, ProgPowZ). Work in progress.
 
+pub mod cl;
+pub mod kernel;
 pub mod progpow;
 
 use crate::engine::{Backend, Config, Log, Stats};

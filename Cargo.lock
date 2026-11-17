@@ -337,6 +337,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "cl3"
+version = "0.13.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a742f287d99be2d7b66db81728cf0c8f7d09468d9c720431d09f89c511fd0208"
+dependencies = [
+ "dlopen2",
+ "libc",
+ "opencl-sys",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -572,6 +584,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
 dependencies = [
  "libloading",
+]
+
+[[package]]
+name = "dlopen2"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60768c353d76ba6dd1b6332a5dbbdd3bc2dddadc2935f4cc6a9d0f17ca8ecb6a"
+dependencies = [
+ "dlopen2_derive",
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "dlopen2_derive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aacdd87ba97c2f83ff479e881e547f776b0a7c42921be22d4391f32b6284050"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -1531,6 +1565,7 @@ dependencies = [
  "eframe",
  "hex",
  "num_cpus",
+ "opencl3",
  "qp-poseidon-core",
  "randomx-rs",
  "rustls",
@@ -1990,6 +2025,25 @@ name = "once_cell_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
+
+[[package]]
+name = "opencl-sys"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55e1202dff32db448cef22cd6d866a18eca87c51c7dc4aa25f11753aa65e6ef7"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "opencl3"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5a58798f7d6105ae156f0e3c644ea2621335949c918b629df5b8bf2b1bb1dd2"
+dependencies = [
+ "cl3",
+ "libc",
+]
 
 [[package]]
 name = "orbclient"
