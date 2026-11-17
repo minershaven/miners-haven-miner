@@ -40,21 +40,24 @@ pub fn cpu_flags() -> u32 {
 /// RandomX cache (256 MB) for one seed. Read-only after init, so safe to share.
 pub struct Cache {
     ptr: *mut c_void,
+    pub large_pages: bool,
 }
 unsafe impl Send for Cache {}
 unsafe impl Sync for Cache {}
 
 impl Cache {
     pub fn new(flags: u32, seed: &[u8]) -> Option<Cache> {
+        let mut large_pages = true;
         let mut ptr = unsafe { randomx_alloc_cache(flags | FLAG_LARGE_PAGES) };
         if ptr.is_null() {
+            large_pages = false;
             ptr = unsafe { randomx_alloc_cache(flags) };
         }
         if ptr.is_null() {
             return None;
         }
         unsafe { randomx_init_cache(ptr, seed.as_ptr() as *const c_void, seed.len()) };
-        Some(Cache { ptr })
+        Some(Cache { ptr, large_pages })
     }
 }
 

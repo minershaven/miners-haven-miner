@@ -5,7 +5,7 @@ use crate::job::{Job, RawJob};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -28,6 +28,7 @@ pub struct Share {
 pub struct Client {
     inner: Arc<Mutex<Option<Conn>>>,
     next_id: Arc<AtomicU64>,
+    stopped: Arc<AtomicBool>,
 }
 
 struct Conn {
@@ -39,13 +40,13 @@ pub const AGENT: &str = concat!("MinersHavenMiner/", env!("CARGO_PKG_VERSION"));
 
 impl Client {
     pub fn new() -> Client {
-        Client { inner: Arc::new(Mutex::new(None)), next_id: Arc::new(AtomicU64::new(10)) }
+        Client { inner: Arc::new(Mutex::new(None)), next_id: Arc::new(AtomicU64::new(10)), stopped: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Connect, log in and read messages forever, reconnecting (with failover across `pools`) on errors.
     pub fn run(&self, pools: Vec<String>, login: String, pass: String, events: Sender<Event>) {
         let mut idx = 0usize;
-        loop {
+        while !self.stopped.load(Ordering::SeqCst) {
             let pool = &pools[idx % pools.len()];
             match self.session(pool, &login, &pass, &events) {
                 Ok(()) => {}
@@ -55,12 +56,27 @@ impl Client {
                 }
             }
             idx += 1;
-            std::thread::sleep(Duration::from_secs(5));
+            for _ in 0..50 {
+                if self.stopped.load(Ordering::SeqCst) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    /// Disconnect and stop reconnecting.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        if let Some(c) = self.inner.lock().unwrap().take() {
+            let _ = c.stream.shutdown(std::net::Shutdown::Both);
         }
     }
 
     fn session(&self, pool: &str, login: &str, pass: &str, events: &Sender<Event>) -> Result<(), String> {
-        let stream = TcpStream::connect(pool).map_err(|e| e.to_string())?;
+        let addr = std::net::ToSocketAddrs::to_socket_addrs(pool).map_err(|e| e.to_string())?
+            .next().ok_or("could not resolve pool address")?;
+        let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(15)).map_err(|e| e.to_string())?;
         stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(Duration::from_secs(300))).ok();
         let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
@@ -79,6 +95,9 @@ impl Client {
         }
         let result = v.get("result").ok_or("login reply without result")?;
         let session = result.get("id").and_then(|x| x.as_str()).ok_or("login reply without id")?.to_string();
+        if self.stopped.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         *self.inner.lock().unwrap() = Some(Conn { stream, session: session.clone() });
         let _ = events.send(Event::Connected(pool.to_string()));
         if let Some(j) = result.get("job") {
@@ -97,6 +116,9 @@ impl Client {
         loop {
             line.clear();
             let n = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+            if self.stopped.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             if n == 0 {
                 return Err("pool closed the connection".into());
             }
