@@ -144,7 +144,8 @@ pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
             while !sh.stop.load(Ordering::SeqCst) {
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(PoolMsg::Job(job)) => {
-                        let same = sh.job.read().unwrap().as_ref().map(|j| j.id == job.id && j.header == job.header).unwrap_or(false);
+                        let same = sh.job.read().unwrap().as_ref().map(|j| j.id == job.id && j.header == job.header && j.target == job.target).unwrap_or(false);
+                        // a pool re-sends the same work with a new target when it changes our share difficulty
                         if same {
                             continue;
                         }
