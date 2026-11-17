@@ -26,7 +26,7 @@ COMMAND LINE (mhminer.exe)
     --coin X      qrl, xmr, qtc, neox, abrs, firo, zano
     --solo        mine SOLO instead of PPLNS
     --region X    auto, us or eu (default auto: the faster server, other one as backup)
-    --large       high-difficulty port for big rigs / rentals (EU server)
+    --large       high-difficulty port for big rigs / rentals
     --threads 4   CPU threads (CPU coins)
     --gpu 0       which graphics card(s) to use (GPU coins; repeat for more)
     --pool HOST:PORT   another pool (stratum+ssl://HOST:PORT for SSL)

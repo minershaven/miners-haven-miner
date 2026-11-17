@@ -51,11 +51,11 @@ pub struct Coin {
 }
 
 pub const COINS: &[Coin] = &[
-    Coin { id: "qrl", symbol: "QRL", name: "QRL", algo: Algo::RandomX, port: 3181, us: false },
+    Coin { id: "qrl", symbol: "QRL", name: "QRL", algo: Algo::RandomX, port: 3181, us: true },
     Coin { id: "xmr", symbol: "XMR", name: "Monero", algo: Algo::RandomX, port: 3141, us: true },
     Coin { id: "qtc", symbol: "QTC", name: "Quantus", algo: Algo::QPow, port: 3101, us: true },
     Coin { id: "neox", symbol: "NEOX", name: "Neoxa", algo: Algo::KawPow, port: 3081, us: true },
-    Coin { id: "abrs", symbol: "ABRS", name: "Aurora Borealis", algo: Algo::KawPow, port: 3161, us: false },
+    Coin { id: "abrs", symbol: "ABRS", name: "Aurora Borealis", algo: Algo::KawPow, port: 3161, us: true },
     Coin { id: "firo", symbol: "FIRO", name: "Firo", algo: Algo::FiroPow, port: 3121, us: true },
     Coin { id: "zano", symbol: "ZANO", name: "Zano", algo: Algo::ProgPowZ, port: 3061, us: true },
 ];
@@ -129,9 +129,9 @@ pub fn ping_regions(coin_id: &str) -> (Option<u32>, Option<u32>) {
 pub fn pool_list(coin_id: &str, solo: bool, large: bool, region: Region, pings: Option<(Option<u32>, Option<u32>)>) -> Vec<String> {
     let Some(c) = coin(coin_id) else { return vec![] };
     let solo_off = if solo { 10 } else { 0 };
-    let eu = format!("{HOST_EU}:{}", c.port + solo_off + if large { 1 } else { 0 });
-    // the US server has no high-difficulty ports; its normal port uses vardiff
-    let us = format!("{HOST_US}:{}", c.port + solo_off);
+    let port = c.port + solo_off + if large { 1 } else { 0 };
+    let eu = format!("{HOST_EU}:{port}");
+    let us = format!("{HOST_US}:{port}");
     if !c.us {
         return vec![eu];
     }
