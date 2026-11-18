@@ -365,7 +365,11 @@ impl Drop for Engine {
 }
 
 pub fn hr(h: f64) -> String {
-    if h >= 1e9 {
+    if h >= 1e15 {
+        format!("{:.2} PH/s", h / 1e15)
+    } else if h >= 1e12 {
+        format!("{:.2} TH/s", h / 1e12)
+    } else if h >= 1e9 {
         format!("{:.2} GH/s", h / 1e9)
     } else if h >= 1e6 {
         format!("{:.2} MH/s", h / 1e6)
