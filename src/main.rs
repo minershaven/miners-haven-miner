@@ -75,6 +75,13 @@ fn main() {
     banner();
     let log: Log = Arc::new(|m: &str| println!("[{}] {m}", engine::timestamp()));
 
+    if args.cuda_probe && std::env::var("MH_MMA_BENCH").is_ok() {
+        match mhminer::cuda::bench::run() {
+            Ok(t) => print!("{t}"),
+            Err(e) => println!(" benchmark failed: {e}"),
+        }
+        return;
+    }
     if args.cuda_probe {
         match mhminer::cuda::probe::run() {
             Ok(report) => println!("{report}"),

@@ -3,6 +3,7 @@
 //! are PTX text built ahead of time (see `kernels/`), which the driver compiles for the card.
 
 pub mod pearl_gpu;
+pub mod bench;
 pub mod probe;
 
 use libloading::{Library, Symbol};
@@ -145,7 +146,11 @@ impl Context {
             let mut dev = 0;
             check("cuDeviceGet", (a.device_get)(&mut dev, index as c_int))?;
             let mut ctx = std::ptr::null_mut();
-            check("cuCtxCreate", (a.ctx_create)(&mut ctx, 0, dev))?;
+            // By default the driver spins on a processor core while the card works. MH_CUDA_BLOCK=1
+            // asks it to sleep instead (4 = CU_CTX_SCHED_BLOCKING_SYNC): kinder to the processor,
+            // not yet shown to cost no speed.
+            let flags = if std::env::var("MH_CUDA_BLOCK").is_ok() { 4 } else { 0 };
+            check("cuCtxCreate", (a.ctx_create)(&mut ctx, flags, dev))?;
             Ok(Context { ctx })
         }
     }

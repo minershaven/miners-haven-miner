@@ -2084,6 +2084,7 @@ dependencies = [
  "primitive-types 0.12.2",
  "qp-poseidon-core",
  "randomx-rs",
+ "rayon",
  "rustls",
  "serde",
  "serde_json",

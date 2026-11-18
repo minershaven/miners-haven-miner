@@ -9,6 +9,7 @@ zk-pow = { git = "https://github.com/pearl-research-labs/pearl", rev = "38dd764"
 pearl-blake3 = { git = "https://github.com/pearl-research-labs/pearl", rev = "38dd764", features = ["serde"] }
 primitive-types = "0.12.1"
 bincode = "1.3.3"
+rayon = "1.10"
 base64 = "0.21"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.8", features = ["derive"] }

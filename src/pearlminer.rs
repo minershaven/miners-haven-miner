@@ -348,6 +348,15 @@ pub fn bench_gpu(index: usize, secs: u64, log: &Log) -> Result<f64, String> {
     Ok(rounds as f64 * work as f64 / total)
 }
 
+/// Processor threads used to key A for one card: (threads each keying one A at a time, worker
+/// threads they share for the parts that run in parallel). Enough to keep a fast card fed
+/// while leaving at least half the processor alone.
+fn prep_threads() -> (usize, usize) {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2);
+    let keyers = (cores / 4).clamp(1, 3);
+    (keyers, (cores / 2).saturating_sub(keyers).clamp(1, 8))
+}
+
 /// One card: keep B for the current block, and scan one keying of A after another. The next
 /// keying is prepared on another thread while the card multiplies the current one.
 fn gpu_mine(dev: crate::cuda::Device, sh: Arc<Shared>, stats: Arc<Stats>, log: Log) {
@@ -363,6 +372,14 @@ fn gpu_mine(dev: crate::cuda::Device, sh: Arc<Shared>, stats: Arc<Stats>, log: L
     let cfg = pearl::config(K);
     let work = (GM as u64 * GN as u64) * K as u64;
     let mut bad = 0u32;
+    let (keyers, workers) = prep_threads();
+    let pool = match rayon::ThreadPoolBuilder::new().num_threads(workers).build() {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            log(&format!("{name}: {e}"));
+            return;
+        }
+    };
     while !sh.stop.load(Ordering::SeqCst) {
         let Some(first) = sh.job.read().unwrap().clone() else {
             std::thread::sleep(Duration::from_millis(200));
@@ -381,20 +398,28 @@ fn gpu_mine(dev: crate::cuda::Device, sh: Arc<Shared>, stats: Arc<Stats>, log: L
             continue;
         }
         log(&format!("{name}: matrices for this block ready in {:.1}s", t.elapsed().as_secs_f64()));
-        // keyings of A, two ahead at most
+        // Keying A (noise and commitment over 16 MB) takes the processor longer than the card
+        // needs to multiply it, so a few threads prepare keyings ahead, each its own counters.
         let (tx, rx) = mpsc::sync_channel::<pearl::GpuRound>(2);
-        let (pj, pstop) = (job.clone(), sh.stop.clone());
-        let prep = std::thread::spawn(move || {
-            let mut counter = 0u64;
-            while !pstop.load(Ordering::Relaxed) {
-                counter += 1;
-                let Some(r) = pj.round(counter) else { continue };
-                if tx.send(r).is_err() {
-                    break;
-                }
-            }
-        });
+        let counter = Arc::new(AtomicU64::new(0));
+        let preps: Vec<_> = (0..keyers)
+            .map(|_| {
+                let (pj, pstop, tx, counter, pool) = (job.clone(), sh.stop.clone(), tx.clone(), counter.clone(), pool.clone());
+                std::thread::spawn(move || {
+                    while !pstop.load(Ordering::Relaxed) {
+                        let c = counter.fetch_add(1, Ordering::Relaxed) + 1;
+                        let Some(r) = pool.install(|| pj.round(c)) else { continue };
+                        if tx.send(r).is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect();
+        drop(tx);
         let (mut t_rate, mut done) = (Instant::now(), 0u64);
+        let (mut waited, mut rounds) = (0.0f64, 0u32);
+        let timing = std::env::var("MH_PEARL_TIMING").is_ok();
         loop {
             if sh.stop.load(Ordering::SeqCst) {
                 break;
@@ -404,7 +429,10 @@ fn gpu_mine(dev: crate::cuda::Device, sh: Arc<Shared>, stats: Arc<Stats>, log: L
             if cur.header.to_bytes() != header {
                 break;
             }
+            let tw = Instant::now();
             let Ok(round) = rx.recv() else { break };
+            waited += tw.elapsed().as_secs_f64();
+            rounds += 1;
             let hits = match gpu.scan(&job, &round, &cur.bound) {
                 Ok(h) => h,
                 Err(e) => {
@@ -418,7 +446,12 @@ fn gpu_mine(dev: crate::cuda::Device, sh: Arc<Shared>, stats: Arc<Stats>, log: L
             if t_rate.elapsed() > Duration::from_secs(2) {
                 let rate = done as f64 / t_rate.elapsed().as_secs_f64();
                 *stats.devices.lock().unwrap() = vec![format!("{name} {}   {:>11}", dev.name, crate::engine::hr(rate))];
-                (t_rate, done) = (Instant::now(), 0);
+                if timing {
+                    let n = rounds.max(1) as f64;
+                    log(&format!("{name}: {rounds} rounds, {:.1} ms each: waiting for the processor {:.1}, loading {:.1}, multiplying {:.1}", t_rate.elapsed().as_secs_f64() * 1e3 / n, waited * 1e3 / n, gpu.load_time * 1e3 / n, gpu.kernel_time * 1e3 / n));
+                    (gpu.load_time, gpu.kernel_time) = (0.0, 0.0);
+                }
+                (t_rate, done, waited, rounds) = (Instant::now(), 0, 0.0, 0);
             }
             for (ri, ci) in hits {
                 // every result is recomputed on the processor before it is sent
@@ -435,6 +468,8 @@ fn gpu_mine(dev: crate::cuda::Device, sh: Arc<Shared>, stats: Arc<Stats>, log: L
             }
         }
         drop(rx);
-        let _ = prep.join();
+        for p in preps {
+            let _ = p.join();
+        }
     }
 }

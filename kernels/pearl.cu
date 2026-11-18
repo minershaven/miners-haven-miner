@@ -1,11 +1,11 @@
 // Pearl (PRL) proof of useful work on NVIDIA tensor cores.
 //
-// One block of 256 threads (8 warps) computes a 128 x 256 block of C = A * B, where A and B are
-// the noised int8 matrices, k columns at a time in chunks of 128 that are first copied into
-// shared memory. Warp w owns rows 16w..16w+15 and all 256 columns. The tensor-core result layout
-// puts rows {g, g+8} and columns {2t, 2t+1} of every 16 x 8 product in lane 4g+t, which is
-// exactly one Pearl hash tile: so each thread reduces its own registers into its own jackpot,
-// hashes it and tests it, and no result ever crosses threads.
+// One block of threads computes a ROWS x 256 block of C = A * B, where A and B are the noised
+// int8 matrices, k columns at a time in chunks of 128. A warp owns R groups of 16 rows and
+// 256 / SPLIT of the columns. The tensor-core result layout puts rows {g, g+8} and columns
+// {2t, 2t+1} of every 16 x 8 product in lane 4g+t, which is exactly one Pearl hash tile: so each
+// thread reduces its own registers into a partial jackpot per row group, and because
+// rotate-and-xor is linear the SPLIT partials of a tile simply xor together at the end.
 //
 // Build:  clang -x cuda -nocudainc -nocudalib --cuda-device-only --cuda-gpu-arch=sm_80 -O3 -S -o pearl.ptx pearl.cu
 typedef unsigned int u32;
@@ -18,16 +18,25 @@ typedef int i32;
 #define RANK 128
 #define JACKPOT 16
 #define LROT 13
-#define NT 32   // 16 x 8 products per warp: all 256 columns
-#define ROWS 128 // rows per block (8 warps x 16)
+#ifndef SPLIT
+#define SPLIT 4 // warps sharing each row group; each takes 256 / SPLIT columns
+#endif
+#define NT (32 / SPLIT)        // 16 x 8 products per warp
+#ifndef ROWS
+#define ROWS 64 // rows per block (a multiple of 16 * R)
+#endif
+#define RG (ROWS / 16) // 16-row groups per block
+#ifndef R
+#define R 4 // row groups per warp: each loaded piece of B then feeds R products
+#endif
+#ifndef PRE
+#define PRE 8 // pieces of B read ahead (divides NT)
+#endif
+#define THREADS (RG / R * 32 * SPLIT) // threads per block
 
 typedef struct { u32 w[4]; } __attribute__((aligned(16))) q4;
 
 DEVICE void mma_s8(i32 c[4], const u32 a[4], u32 b0, u32 b1) {
-#ifdef NO_MMA
-  c[0] ^= a[0] ^ b0; c[1] ^= a[1] ^ b1; c[2] ^= a[2]; c[3] ^= a[3];
-  return;
-#endif
   asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
       : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
@@ -66,110 +75,164 @@ DEVICE void blake3_keyed64(const u32 key[8], const u32 msg[16], u32 out[8]) {
   out[4] = v4 ^ v12; out[5] = v5 ^ v13; out[6] = v6 ^ v14; out[7] = v7 ^ v15;
 }
 
-// Rearrange a row-major int8 matrix (rows x k) into the order the scan reads it:
-// [chunk of 128 columns][block of `per` rows][16-byte group q][row in block], so that everything
-// one thread block needs for one chunk is a single contiguous run, laid out exactly as its
-// shared-memory copy. One thread per 16-byte group; `count` groups in all.
-KERNEL void pearl_pack(const q4 *src, q4 *dst, u32 rows, u32 per, u32 kq, u32 count) {
+// Operand layout. A tensor-core product takes its operands as registers spread over the 32 lanes
+// of a warp (g = lane / 4, t = lane % 4): for the 16 x 32 piece of A, lane 4g+t holds words t and
+// t+4 of rows g and g+8; for the 8 x 32 piece of B (stored transposed), words t and t+4 of
+// column g. The two packing kernels store A and B on the card in exactly that order, so the scan
+// fetches the operands of a product with one coalesced read each:
+//   A: [chunk of 128][block of ROWS rows][32-wide step][16-row group][lane] -> 4 words
+//   B: [chunk of 128][block of 256 columns][32-wide step][8-column group][lane] -> 2 words
+// src is the row-major int8 matrix (B transposed), k bytes per row; one thread per entry.
+KERNEL void pearl_pack_a(const u32 *src, q4 *dst, u32 k, u32 blocks, u32 count) {
   u32 i = __nvvm_read_ptx_sreg_ctaid_x() * __nvvm_read_ptx_sreg_ntid_x() + __nvvm_read_ptx_sreg_tid_x();
   if (i >= count) return;
-  u32 r = i % per, q = (i / per) & 7, blk = (i / (per * 8)) % (rows / per), c = i / (per * 8 * (rows / per));
-  dst[i] = src[(u64)(blk * per + r) * kq + c * 8 + q];
+  u32 lane = i & 31, g = lane >> 2, t = lane & 3, u = i >> 5;
+  u32 rg = u % RG, s = (u / RG) & 3, blk = (u / (RG * 4)) % blocks, c = u / (RG * 4 * blocks);
+  u32 row = blk * ROWS + rg * 16 + g;
+  const u32 *lo = src + ((u64)row * k + c * RANK + s * 32) / 4 + t, *hi = lo + (u64)8 * k / 4;
+  q4 v;
+  v.w[0] = lo[0]; v.w[1] = hi[0]; v.w[2] = lo[4]; v.w[3] = hi[4];
+  dst[i] = v;
 }
 
-// The jackpot words of this thread's tile in block (rb, cb).
-// an, bn: A and B-transposed with noise, packed by pearl_pack (128 and 256 rows per block);
-// ablocks, bblocks: m / 128 and n / 256. Shared copies are [16-byte group][row][word], which
-// puts the 32 lanes of a warp on 32 different banks for every read below.
-DEVICE void block_jackpot(const q4 *an, const q4 *bn, u32 kw, u32 ablocks, u32 bblocks, u32 rb, u32 cb, u32 jack[JACKPOT]) {
-  static SHARED q4 sa4[8 * ROWS];
-  // B as [32-column step][column][t] pairs: words 8s+t and 8s+4+t side by side, one 64-bit read
-  static SHARED u64 sb[4 * 256 * 4];
-  const u32 *sa = (const u32 *)sa4;
+KERNEL void pearl_pack_b(const u32 *src, u64 *dst, u32 k, u32 blocks, u32 count) {
+  u32 i = __nvvm_read_ptx_sreg_ctaid_x() * __nvvm_read_ptx_sreg_ntid_x() + __nvvm_read_ptx_sreg_tid_x();
+  if (i >= count) return;
+  u32 lane = i & 31, g = lane >> 2, t = lane & 3, u = i >> 5;
+  u32 cg = u & 31, s = (u >> 5) & 3, blk = (u >> 7) % blocks, c = (u >> 7) / blocks;
+  u32 col = blk * 256 + cg * 8 + g;
+  const u32 *p = src + ((u64)col * k + c * RANK + s * 32) / 4 + t;
+  dst[i] = p[0] | (u64)p[4] << 32;
+}
+
+// The jackpot words of this thread's R tiles in block (rb, cb). Returns 1 in the threads that
+// end up holding complete jackpots (with SPLIT > 1 the others hold nothing useful).
+// an, bn: A and B-transposed with noise, packed as above; ablocks, bblocks: m / ROWS and n / 256.
+// Nothing is copied into shared memory: every warp reads its operands where they lie, and the
+// card's cache serves the warps (and neighbouring blocks) that share a piece of B.
+DEVICE int block_jackpot(const q4 *an, const u64 *bn, u32 kw, u32 ablocks, u32 bblocks, u32 rb, u32 cb, u32 jack[R][JACKPOT]) {
   u32 tid = __nvvm_read_ptx_sreg_tid_x();
-  u32 warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  u32 warp = tid >> 5, lane = tid & 31;
+  u32 wr = warp / SPLIT, wc = warp % SPLIT;
 
-
-  i32 acc[NT][4];
-  for (int j = 0; j < NT; j++) acc[j][0] = acc[j][1] = acc[j][2] = acc[j][3] = 0;
-  for (int i = 0; i < JACKPOT; i++) jack[i] = 0;
+  i32 acc[R][NT][4];
+  for (int r = 0; r < R; r++) {
+    for (int j = 0; j < NT; j++) acc[r][j][0] = acc[r][j][1] = acc[r][j][2] = acc[r][j][3] = 0;
+    for (int i = 0; i < JACKPOT; i++) jack[r][i] = 0;
+  }
 
   u32 chunks = kw / (RANK / 4);
   for (u32 c = 0; c < chunks; c++) {
-#ifdef STAGE_ONCE
-    if (c == 0) {
-#endif
-#ifndef NO_STAGE
-    const q4 *asrc = an + (u64)(c * ablocks + rb) * (ROWS * 8);
-    const q4 *bsrc = bn + (u64)(c * bblocks + cb) * (256 * 8);
-    for (u32 i = tid; i < ROWS * 8; i += 256) sa4[i] = asrc[i];
-    for (u32 i = tid; i < 256 * 4; i += 256) {
-      u32 s = i >> 8, col = i & 255;
-      q4 lo = bsrc[(2 * s) * 256 + col], hi = bsrc[(2 * s + 1) * 256 + col];
-      u64 *d = sb + (u64)i * 4;
-      d[0] = lo.w[0] | (u64)hi.w[0] << 32;
-      d[1] = lo.w[1] | (u64)hi.w[1] << 32;
-      d[2] = lo.w[2] | (u64)hi.w[2] << 32;
-      d[3] = lo.w[3] | (u64)hi.w[3] << 32;
-    }
-#endif
-#ifdef STAGE_ONCE
-    }
-#endif
-    __nvvm_bar_sync(0);
-    for (u32 s = 0; s < RANK / 32; s++) {
-      // words 8s+t and 8s+4+t of rows g and g+8
-      const u32 *pa = sa + ((2 * s) * ROWS + warp * 16 + g) * 4 + t;
-      u32 av[4] = {pa[0], pa[8 * 4], pa[ROWS * 4], pa[ROWS * 4 + 8 * 4]};
-      const u64 *pb = sb + (s * 256 + g) * 4 + t;
+    const q4 *ga = an + (u64)(c * ablocks + rb) * (4 * RG * 32) + (wr * R) * 32 + lane;
+    const u64 *gb = bn + (u64)(c * bblocks + cb) * (4 * 32 * 32) + (wc * NT) * 32 + lane;
+#ifdef APRE
+    q4 aq[RANK / 32][R];
 #pragma clang loop unroll(full)
-      for (int j = 0; j < NT; j++) {
-        u64 v = pb[j * 32];
-        mma_s8(acc[j], av, (u32)v, (u32)(v >> 32));
+    for (int s = 0; s < RANK / 32; s++) {
+#pragma clang loop unroll(full)
+      for (int r = 0; r < R; r++) aq[s][r] = ga[(s * RG + r) * 32];
+    }
+#endif
+#pragma clang loop unroll(full)
+    for (int s = 0; s < RANK / 32; s++) {
+      q4 av[R];
+#pragma clang loop unroll(full)
+      for (int r = 0; r < R; r++) {
+#ifdef APRE
+        av[r] = aq[s][r];
+#else
+        av[r] = ga[(s * RG + r) * 32];
+#endif
+      }
+      const u64 *pb = gb + s * (32 * 32);
+      // read PRE pieces of B ahead of the products that use them: a warp waits for each read
+      // it has issued, so issuing them in batches lets the waits overlap
+#pragma clang loop unroll(full)
+      for (int j0 = 0; j0 < NT; j0 += PRE) {
+        u64 v[PRE];
+#pragma clang loop unroll(full)
+        for (int i = 0; i < PRE; i++) v[i] = pb[(j0 + i) * 32];
+#pragma clang loop unroll(full)
+        for (int i = 0; i < PRE; i++) {
+#pragma clang loop unroll(full)
+          for (int r = 0; r < R; r++) mma_s8(acc[r][j0 + i], av[r].w, (u32)v[i], (u32)(v[i] >> 32));
+        }
       }
     }
-    u32 x = 0;
-#pragma clang loop unroll(full)
-    for (int j = 0; j < NT; j++) x ^= (u32)acc[j][0] ^ (u32)acc[j][1] ^ (u32)acc[j][2] ^ (u32)acc[j][3];
     u32 slot = c % JACKPOT;
-    jack[slot] = rotl(jack[slot], LROT) ^ x;
-    __nvvm_bar_sync(0);
+#pragma clang loop unroll(full)
+    for (int r = 0; r < R; r++) {
+      u32 x = 0;
+#pragma clang loop unroll(full)
+      for (int j = 0; j < NT; j++) x ^= (u32)acc[r][j][0] ^ (u32)acc[r][j][1] ^ (u32)acc[r][j][2] ^ (u32)acc[r][j][3];
+      jack[r][slot] = rotl(jack[r][slot], LROT) ^ x;
+    }
   }
+#if SPLIT > 1
+  // pass the partial jackpots through shared memory, one row group of one column part at a
+  // time, and fold them into the first warp's
+  static SHARED u32 park[RG / R * 32 * JACKPOT];
+  for (u32 o = 1; o < SPLIT; o++)
+    for (int r = 0; r < R; r++) {
+      u32 *slot = park + (wr * 32 + lane) * JACKPOT;
+      if (wc == o)
+        for (int i = 0; i < JACKPOT; i++) slot[i] = jack[r][i];
+      __nvvm_bar_sync(0);
+      if (wc == 0)
+        for (int i = 0; i < JACKPOT; i++) jack[r][i] ^= slot[i];
+      __nvvm_bar_sync(0);
+    }
+  if (wc > 0) return 0;
+#endif
+  return 1;
+}
+
+DEVICE int under(const u32 h[8], const u32 *bound) {
+  // the hash is a little-endian 256-bit number: compare from the most significant word
+  for (int i = 7; i >= 0; i--) {
+    u32 bw = bound[i];
+    if (h[i] != bw) return h[i] < bw;
+  }
+  return 1;
 }
 
 // key: the A noise seed (8 words); bound: 256-bit bound, least significant word first
-// hits: [0] = count, then one word per hit: (row block << 23) | (column block << 8) | thread
-// Grid: (m / 128, n / 256), 256 threads per block.
-KERNEL void pearl_scan(const q4 *an, const q4 *bn, u32 kw, u32 ablocks, u32 bblocks, const u32 *key, const u32 *bound, u32 *hits, u32 max_hits) {
+// hits: [0] = count, then one word per hit: (row block << 23) | (column block << 10) | tile,
+// tile = row group * 32 + lane.  Grid: (m / ROWS, n / 256), THREADS threads per block.
+KERNEL void pearl_scan(const q4 *an, const u64 *bn, u32 kw, u32 ablocks, u32 bblocks, const u32 *key, const u32 *bound, u32 *hits, u32 max_hits) {
   // row blocks vary fastest, so blocks running together share one stretch of B and all of A
   // stays in the card's cache
   u32 rb = __nvvm_read_ptx_sreg_ctaid_x(), cb = __nvvm_read_ptx_sreg_ctaid_y();
-  u32 jack[JACKPOT];
-  block_jackpot(an, bn, kw, ablocks, bblocks, rb, cb, jack);
+  u32 tid = __nvvm_read_ptx_sreg_tid_x();
+  u32 jack[R][JACKPOT];
+  if (!block_jackpot(an, bn, kw, ablocks, bblocks, rb, cb, jack)) return;
   u32 k8[8], h[8];
   for (int i = 0; i < 8; i++) k8[i] = key[i];
-  blake3_keyed64(k8, jack, h);
-  // the hash is a little-endian 256-bit number: compare from the most significant word
-  int le = 1;
-  for (int i = 7; i >= 0; i--) {
-    u32 bw = bound[i];
-    if (h[i] != bw) { le = h[i] < bw; break; }
-  }
-  if (le) {
-    u32 slot = __sync_fetch_and_add(&hits[0], 1u);
-    if (slot < max_hits) hits[1 + slot] = (rb << 23) | (cb << 8) | __nvvm_read_ptx_sreg_tid_x();
+  for (int r = 0; r < R; r++) {
+    blake3_keyed64(k8, jack[r], h);
+    if (under(h, bound)) {
+      u32 slot = __sync_fetch_and_add(&hits[0], 1u);
+      u32 tile = ((tid >> 5) / SPLIT * R + r) * 32 + (tid & 31);
+      if (slot < max_hits) hits[1 + slot] = (rb << 23) | (cb << 10) | tile;
+    }
   }
 }
 
 // Debug: the 16 jackpot words and 8 hash words of every tile of block (0, 0), for checking
-// against the processor. out: 256 threads x 24 words.
-KERNEL void pearl_debug(const q4 *an, const q4 *bn, u32 kw, const u32 *key, u32 *out) {
+// against the processor. out: ROWS * 2 tiles x 24 words, tile = row group * 32 + lane.
+KERNEL void pearl_debug(const q4 *an, const u64 *bn, u32 kw, const u32 *key, u32 *out) {
   u32 tid = __nvvm_read_ptx_sreg_tid_x();
-  u32 jack[JACKPOT];
-  block_jackpot(an, bn, kw, 1, 1, 0, 0, jack);
+  u32 jack[R][JACKPOT];
+  if (!block_jackpot(an, bn, kw, 1, 1, 0, 0, jack)) return;
   u32 k8[8], h[8];
   for (int i = 0; i < 8; i++) k8[i] = key[i];
-  blake3_keyed64(k8, jack, h);
-  for (int i = 0; i < JACKPOT; i++) out[tid * 24 + i] = jack[i];
-  for (int i = 0; i < 8; i++) out[tid * 24 + 16 + i] = h[i];
+  for (int r = 0; r < R; r++) {
+    u32 tile = ((tid >> 5) / SPLIT * R + r) * 32 + (tid & 31);
+    blake3_keyed64(k8, jack[r], h);
+    for (int i = 0; i < JACKPOT; i++) out[tile * 24 + i] = jack[r][i];
+    for (int i = 0; i < 8; i++) out[tile * 24 + 16 + i] = h[i];
+  }
 }
+
+// Threads per block and rows per block in this build (the host sizes its launches from them).
+KERNEL void pearl_split(u32 *out) { out[0] = THREADS; out[1] = ROWS; }
