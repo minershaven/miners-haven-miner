@@ -4,6 +4,12 @@ version = "2.5.0"
 edition = "2024"
 
 [dependencies]
+# Pearl (PRL) proof-of-useful-work: upstream proof construction and checking (ISC licence)
+zk-pow = { git = "https://github.com/pearl-research-labs/pearl", rev = "38dd764" }
+pearl-blake3 = { git = "https://github.com/pearl-research-labs/pearl", rev = "38dd764", features = ["serde"] }
+primitive-types = "0.12.1"
+bincode = "1.3.3"
+base64 = "0.21"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 clap = { version = "4.6.8", features = ["derive"] }
 eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "wayland", "x11", "clipboard", "links"] }
