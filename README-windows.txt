@@ -1,10 +1,11 @@
-Miners Haven Miner 2.5  -  theminershaven.org
+Miners Haven Miner 2.6  -  theminershaven.org
 =============================================
 
 COINS
   On your processor (CPU):    QRL, XMR (RandomX)
   On your graphics card (GPU): NEOX, ABRS (KawPoW)  FIRO (FiroPoW)  ZANO (ProgPowZ)
   On GPU and/or CPU:           QTC (QPoW)
+  On an NVIDIA RTX card:       PRL (Pearl) - RTX 30 series or newer; much slower on a CPU
   GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
 
 DESKTOP APP
@@ -28,10 +29,11 @@ DEV FEE
 COMMAND LINE (mhminer.exe)
   mhminer.exe --coin neox --wallet YOUR_ADDRESS --worker rig1
   mhminer.exe --coin zano --bench 20        (GPU speed test)
+  mhminer.exe --coin prl --bench 20         (Pearl speed test, NVIDIA RTX)
   mhminer.exe --coin xmr --bench 20         (CPU speed test)
 
   Options:
-    --coin X      qrl, xmr, qtc, neox, abrs, firo, zano
+    --coin X      qrl, xmr, qtc, neox, abrs, firo, zano, prl
     --solo        mine SOLO instead of PPLNS
     --region X    auto, us or eu (default auto: the faster server, other one as backup)
     --large       high-difficulty port for big rigs / rentals
