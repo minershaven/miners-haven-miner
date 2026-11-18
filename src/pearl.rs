@@ -38,19 +38,10 @@ pub fn config(k: usize) -> MiningConfiguration {
     MiningConfiguration { common_dim: k as u32, rank: RANK as u16, mma_type: MMAType::Int7xInt7ToInt32, rows_pattern: rows, cols_pattern: cols, moe: None }
 }
 
-/// The 76-byte incomplete block header a pool sends (hex).
+/// The 76-byte incomplete block header a pool sends (hex). The wire form holds the previous
+/// block hash and Merkle root byte-reversed, which Pearl's own parser undoes.
 pub fn parse_header(hex76: &str) -> Option<IncompleteBlockHeader> {
-    let b = hex::decode(hex76.trim()).ok()?;
-    if b.len() != 76 {
-        return None;
-    }
-    Some(IncompleteBlockHeader {
-        version: u32::from_le_bytes(b[0..4].try_into().ok()?),
-        prev_block: b[4..36].try_into().ok()?,
-        merkle_root: b[36..68].try_into().ok()?,
-        timestamp: u32::from_le_bytes(b[68..72].try_into().ok()?),
-        nbits: u32::from_le_bytes(b[72..76].try_into().ok()?),
-    })
+    IncompleteBlockHeader::from_bytes(&hex::decode(hex76.trim()).ok()?).ok()
 }
 
 /// The hash bound for one tile, from a pool's share target (64 hex chars, big-endian).
@@ -262,6 +253,8 @@ mod tests {
         let h = parse_header(&hex76).unwrap();
         assert_eq!(h.version, 0x2040_0000);
         assert_eq!(h.nbits, 0x1b01_4f8a);
+        // what we hash into the job key must be the pool's bytes exactly
+        assert_eq!(hex::encode(h.to_bytes()), hex76);
         assert!(parse_header("00").is_none());
         let cfg = config(4096);
         let t = "00000000ffff".to_string() + &"0".repeat(52);
