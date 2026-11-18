@@ -1,26 +1,64 @@
 # Miners Haven Miner
 
-Our own RandomX CPU miner for [theminershaven.org](https://theminershaven.org), written in Rust.
+One miner for CPU and GPU coins, made for [theminershaven.org](https://theminershaven.org) and written in Rust.
+Windows desktop app plus the `mhminer` command line for Windows and Linux.
 
-- Coins: **QRL** and **Monero (XMR)**. GPU coins and a desktop app come next.
+**0% dev fee on Miners Haven pools.**
+
+[Download the latest release](https://github.com/minershaven/miners-haven-miner/releases/latest) ·
+[Website](https://theminershaven.org) · [Discord](https://discord.gg/qwyVDDS9J)
+
+## Coins
+
+| Coin | Algorithm | Hardware |
+| --- | --- | --- |
+| Pearl (PRL) | Pearl | NVIDIA RTX 30-series or newer |
+| Quantus (QTC) | QPoW | GPU or CPU |
+| Neoxa (NEOX) | KawPoW | GPU |
+| ABRS | KawPoW | GPU |
+| Firo (FIRO) | FiroPoW | GPU |
+| Zano (ZANO) | ProgPowZ | GPU |
+| QRL | RandomX | CPU |
+| Monero (XMR) | RandomX | CPU |
+
+GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
+
+## Dev fee
+
+- Miners Haven pools: **none**.
+- Any other pool: 1.5% of the time (90 seconds in every 100 minutes, the first after 15 minutes).
+  The log shows when the dev fee starts and ends, and shares found in that time are not counted in your totals.
+
+## Features
+
+- Desktop app: pick a coin, paste your wallet, press Start. Settings are remembered.
 - Picks the right Miners Haven pool and port for you; SOLO or PPLNS.
-- Fast mode (2 GB dataset, built on all cores, huge pages when available) or light mode (256 MB).
-- Built-in self-test against the official RandomX test vectors, and a benchmark.
+- Region: auto (fastest), US (St. Louis) or EU (Germany), with the other server as backup.
+- Per-GPU speed, temperature, fan and power.
+- Huge pages for RandomX (about 10-20% faster).
+- Mines on other pools too: choose the algorithm and fill in pool, wallet and password.
 
-The RandomX algorithm itself is the official reference library by tevador (BSD-3-Clause), compiled in
-through the `randomx-rs` crate. Everything else (pool protocol, job handling, threading, stats) is ours.
-
-## Use
+## Command line
 
 ```
-mhminer --coin qrl --wallet <your QRL address> --worker rig1
-mhminer --coin xmr --wallet <your XMR address> --solo
-mhminer --selftest          # check this machine computes correct hashes
-mhminer --bench 30          # measure your hashrate, no pool needed
+mhminer --coin neox --wallet YOUR_ADDRESS --worker rig1
+mhminer --coin qrl --wallet YOUR_ADDRESS --solo
+mhminer --coin prl --bench 20        # Pearl speed test, NVIDIA RTX
+mhminer --coin xmr --bench 20        # CPU speed test
 ```
 
-Options: `--threads N`, `--light`, `--large` (high-difficulty port for big CPUs / rentals),
-`--pool host:port` (repeat for failover).
+| Option | Meaning |
+| --- | --- |
+| `--coin X` | qrl, xmr, qtc, neox, abrs, firo, zano, prl |
+| `--solo` | mine SOLO instead of PPLNS |
+| `--region X` | auto, us or eu (default auto) |
+| `--large` | high-difficulty port for big rigs and rentals |
+| `--threads N` | CPU threads (CPU coins) |
+| `--gpu N` | graphics card to use (repeat for more) |
+| `--pool HOST:PORT` | another pool (`stratum+ssl://HOST:PORT` for SSL) |
+| `--user` / `--pass` | login and password for other pools |
+
+Windows Defender may warn about a crypto miner; that is expected for an unsigned miner.
 
 ## Build
 
@@ -36,3 +74,5 @@ Windows .exe from Linux (mingw-w64):
 mkdir -p win-static && cp $(x86_64-w64-mingw32-g++ -print-file-name=libstdc++.a) win-static/libstdc++.dll.a
 cargo build --release --target x86_64-pc-windows-gnu
 ```
+
+RandomX uses the official reference library by tevador (BSD-3-Clause) through the `randomx-rs` crate.
