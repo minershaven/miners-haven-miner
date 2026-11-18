@@ -58,6 +58,7 @@ KERNEL void b_f16x8(u32 iters, u32 *out) {
 // step 0 keeps every warp on its own few groups (always cached); step 1 streams through buf.
 // per: products per read (the operand is reused for `per` accumulators).
 typedef unsigned long long u64;
+#define EVERY(it)
 #define LOADED(NAME, NACC, PER, SPACE)                                                         \
   KERNEL void NAME(u32 iters, u32 *out, const u64 *buf, u32 groups, u32 span, u32 step) {      \
     u32 tid = __nvvm_read_ptx_sreg_tid_x(), lane = tid & 31;                                   \
@@ -79,6 +80,7 @@ typedef unsigned long long u64;
       }                                                                                        \
       _Pragma("clang loop unroll(full)")                                                       \
       for (int j = 0; j < NACC / PER; j++) cur[j] = nxt[j];                                    \
+      EVERY(it)                                                                                \
     }                                                                                          \
     u32 x = 0;                                                                                 \
     for (int j = 0; j < NACC; j++) x ^= c[j][0] ^ c[j][1] ^ c[j][2] ^ c[j][3];                 \
@@ -97,3 +99,12 @@ LOADED(b_ld4x8, 8, 4, FROM_GLOBAL)
 LOADED(b_ld4x16, 16, 4, FROM_GLOBAL)
 LOADED(b_sh1x8, 8, 1, FROM_SHARED)
 LOADED(b_sh4x8, 8, 4, FROM_SHARED)
+
+// the same with every warp of the block meeting at a barrier each 16 or 4 rounds (128 or 32
+// products per thread), to price the barrier itself
+#undef EVERY
+#define EVERY(it) if ((it & 15) == 15) __nvvm_bar_sync(0);
+LOADED(b_sh4x8_bar128, 8, 4, FROM_SHARED)
+#undef EVERY
+#define EVERY(it) if ((it & 3) == 3) __nvvm_bar_sync(0);
+LOADED(b_sh4x8_bar32, 8, 4, FROM_SHARED)

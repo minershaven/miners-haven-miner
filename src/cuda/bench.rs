@@ -13,7 +13,7 @@ pub fn run() -> Result<String, String> {
     let mut text = format!(" {}\n", d.name);
     // (kernel, accumulators, multiply-accumulates per product)
     let kernels = [("b_k32x16", 16, 4096.0), ("b_k32x8", 8, 4096.0), ("b_k32x4", 4, 4096.0), ("b_k16x8", 8, 2048.0), ("b_f16x8", 8, 2048.0)];
-    for (name, nacc, mac) in kernels {
+    for (name, nacc, mac) in kernels.into_iter().take(1) {
         let f = ctx.function(&module, name)?;
         for threads in [128u32, 512] {
             let blocks = 36 * 16 * 1024 / threads;
@@ -33,13 +33,33 @@ pub fn run() -> Result<String, String> {
             text += &format!("   {name:10} {threads:5} threads/block: {:7.2} G warp-ops/s  {:7.2} T MAC/s  ({:.0} ms)\n", ops / secs / 1e9, ops * mac / secs / 1e12, secs * 1e3);
         }
     }
+    // how many warps does an SM need to keep its tensor cores busy? One block per SM.
+    for name in ["b_k32x16", "b_k32x4"] {
+        let f = ctx.function(&module, name)?;
+        let nacc = if name == "b_k32x16" { 16u32 } else { 4 };
+        for threads in [32u32, 64, 128, 256, 512] {
+            let blocks = 36u32;
+            let iters = 6_000_000 / nacc * 32 / threads;
+            if ctx.launch(f, (blocks, 1), threads, &mut [Arg::U32(8), Arg::Ptr(out.ptr)]).is_err() {
+                continue;
+            }
+            let mut v = [0u32];
+            ctx.download(&out, &mut v)?;
+            let t = Instant::now();
+            ctx.launch(f, (blocks, 1), threads, &mut [Arg::U32(iters), Arg::Ptr(out.ptr)])?;
+            ctx.download(&out, &mut v)?;
+            let secs = t.elapsed().as_secs_f64();
+            let ops = blocks as f64 * (threads / 32) as f64 * iters as f64 * nacc as f64;
+            text += &format!("   {name:9} {:2} warps per SM ({} regs): {:6.2} T MAC/s\n", threads / 32, ctx.registers(f), ops * 4096.0 / secs / 1e12);
+        }
+    }
     // with operands read from memory: (kernel, accumulators, products per read)
     let groups_big = (1usize << 30) / 256;
     let buf = ctx.alloc(groups_big * 256)?;
     ctx.zero(&buf)?;
     // (label, groups in play, groups between warps, step per round)
     let places: [(&str, u32, u32, u32); 4] = [("always cached", groups_big as u32, 8, 0), ("16 MB, streamed", 65536, 8, 1), ("1 GB, streamed", groups_big as u32, 4096, 1), ("shared with 7 warps", groups_big as u32, 1, 0)];
-    for (name, nacc, per) in [("b_ld1x8", 8u32, 1u32), ("b_ld2x8", 8, 2), ("b_ld4x8", 8, 4), ("b_ld4x16", 16, 4), ("b_sh1x8", 8, 1), ("b_sh4x8", 8, 4)] {
+    for (name, nacc, per) in [("b_sh4x8", 8u32, 4u32)] {
         let f = ctx.function(&module, name)?;
         let threads = 256u32;
         let blocks = 36 * 16 * 1024 / threads;
