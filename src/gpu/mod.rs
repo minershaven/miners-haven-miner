@@ -83,7 +83,7 @@ fn pick_gpus(cfg: &Config) -> Vec<GpuInfo> {
     list_gpus().into_iter().filter(|g| cfg.gpus.is_empty() || cfg.gpus.contains(&g.index)).collect()
 }
 
-pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
+pub fn start(cfg: &Config, route: Arc<crate::fee::Route>, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
     let v = variant(cfg.algo);
     let gpus = pick_gpus(cfg);
     if gpus.is_empty() {
@@ -112,8 +112,8 @@ pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
     let mut handles = Vec::new();
     {
         let c = client.clone();
-        let (pools, login, pass) = (cfg.pools.clone(), cfg.login.clone(), cfg.pass.clone());
-        std::thread::spawn(move || c.run(pools, login, pass, tx));
+        let route = route.clone();
+        std::thread::spawn(move || c.run(route, tx));
     }
     {
         let c = client.clone();

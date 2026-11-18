@@ -74,7 +74,7 @@ fn salt() -> u64 {
     x ^ (x >> 33)
 }
 
-pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
+pub fn start(cfg: &Config, route: Arc<crate::fee::Route>, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
     let gpus: Vec<crate::gpu::cl::GpuInfo> =
         crate::gpu::list_gpus().into_iter().filter(|g| cfg.gpus.is_empty() || cfg.gpus.contains(&g.index)).collect();
     let threads = if gpus.is_empty() { cfg.threads.max(1) } else { cfg.threads };
@@ -97,8 +97,8 @@ pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
     let mut handles = Vec::new();
     {
         let c = client.clone();
-        let (pools, login, pass) = (cfg.pools.clone(), cfg.login.clone(), cfg.pass.clone());
-        std::thread::spawn(move || c.run(pools, login, pass, vec!["quantus".into()], ev_tx));
+        let route = route.clone();
+        std::thread::spawn(move || c.run(route, vec!["quantus".into()], ev_tx));
     }
     {
         let c = client.clone();

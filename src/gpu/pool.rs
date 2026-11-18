@@ -87,19 +87,25 @@ impl PoolClient {
         *self.out.lock().unwrap() = None;
     }
 
-    pub fn run(&self, pools: Vec<String>, login: String, pass: String, tx: Sender<PoolMsg>) {
-        *self.worker.lock().unwrap() = login.clone();
+    pub fn run(&self, route: Arc<crate::fee::Route>, tx: Sender<PoolMsg>) {
         let mut idx = 0;
         while !self.stopped.load(Ordering::SeqCst) {
-            let pool = &pools[idx % pools.len()];
-            if let Err(e) = self.session(pool, &login, &pass, &tx) {
+            let (generation, dest) = route.current();
+            *self.worker.lock().unwrap() = dest.login.clone();
+            let pool = &dest.pools[idx % dest.pools.len()];
+            if let Err(e) = self.session(pool, &dest.login, &dest.pass, &tx, &route, generation) {
                 let _ = tx.send(PoolMsg::Ev(Event::Disconnected(format!("{pool}: {e}"))));
             }
             *self.out.lock().unwrap() = None;
+            if route.generation() != generation {
+                // the destination changed (dev fee slice started or ended): reconnect right away
+                idx = 0;
+                continue;
+            }
             idx += 1;
             for _ in 0..50 {
-                if self.stopped.load(Ordering::SeqCst) {
-                    return;
+                if self.stopped.load(Ordering::SeqCst) || route.generation() != generation {
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -127,7 +133,7 @@ impl PoolClient {
         }
     }
 
-    fn session(&self, pool_s: &str, login: &str, pass: &str, tx: &Sender<PoolMsg>) -> Result<(), String> {
+    fn session(&self, pool_s: &str, login: &str, pass: &str, tx: &Sender<PoolMsg>, route: &crate::fee::Route, generation: u64) -> Result<(), String> {
         let pool = parse_pool(pool_s)?;
         let mut stream = open(&pool)?;
         let (out_tx, out_rx): (Sender<String>, Receiver<String>) = mpsc::channel();
@@ -157,7 +163,7 @@ impl PoolClient {
         let mut last_rx = Instant::now();
         let mut last_poll = Instant::now();
         loop {
-            if self.stopped.load(Ordering::SeqCst) {
+            if self.stopped.load(Ordering::SeqCst) || route.generation() != generation {
                 return Ok(());
             }
             while let Ok(line) = out_rx.try_recv() {

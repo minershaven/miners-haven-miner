@@ -196,6 +196,10 @@ pub struct Stats {
     pub diff_text: Mutex<String>,
     /// hottest GPU in °C (0 = unknown / not a GPU coin)
     pub gpu_temp: AtomicU64,
+    /// A dev fee slice is running: shares and connections belong to the developer, not the user.
+    pub fee: AtomicBool,
+    /// When the connection last moved between the user's pool and the dev fee destination.
+    pub switched: Mutex<Instant>,
     pub started: Instant,
 }
 
@@ -215,6 +219,8 @@ impl Stats {
             devices: Mutex::new(Vec::new()),
             diff_text: Mutex::new(String::new()),
             gpu_temp: AtomicU64::new(0),
+            fee: AtomicBool::new(false),
+            switched: Mutex::new(Instant::now() - Duration::from_secs(3600)),
             started: Instant::now(),
         }
     }
@@ -228,9 +234,18 @@ impl Stats {
         match ev {
             Event::Connected(p) => {
                 self.connected.store(true, Ordering::SeqCst);
-                *self.pool.lock().unwrap() = p.clone();
-                log(&format!("connected to {p}"));
+                if self.fee.load(Ordering::SeqCst) {
+                    log(&format!("dev fee: connected to {p}"));
+                } else {
+                    *self.pool.lock().unwrap() = p.clone();
+                    log(&format!("connected to {p}"));
+                }
             }
+            // shares found during a dev fee slice are the developer's: keep them out of the user's totals
+            // a share found just before a switch belongs to the previous connection; its rejection is not the user's
+            Event::Rejected(_) if self.switched.lock().unwrap().elapsed() < Duration::from_secs(8) => {}
+            Event::Accepted if self.fee.load(Ordering::SeqCst) => log("dev fee: share accepted"),
+            Event::Rejected(e) if self.fee.load(Ordering::SeqCst) => log(&format!("dev fee: share rejected: {e}")),
             Event::Disconnected(e) => {
                 self.connected.store(false, Ordering::SeqCst);
                 self.set_status("reconnecting");
@@ -294,15 +309,17 @@ pub struct Engine {
 impl Engine {
     pub fn start(cfg: Config, log: Log) -> Engine {
         let stats = Arc::new(Stats::new());
+        let route = crate::fee::Route::new(&cfg);
+        log(&crate::fee::notice(&cfg));
         let backend = match cfg.algo {
-            Algo::RandomX => crate::rxminer::start(&cfg, stats.clone(), log.clone()),
-            Algo::QPow => crate::qtcminer::start(&cfg, stats.clone(), log.clone()),
-            Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ => crate::gpu::start(&cfg, stats.clone(), log.clone()),
+            Algo::RandomX => crate::rxminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
+            Algo::QPow => crate::qtcminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
+            Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ => crate::gpu::start(&cfg, route.clone(), stats.clone(), log.clone()),
         };
         // a speed line in the log once a minute
         let report = Arc::new(AtomicBool::new(false));
         {
-            let (st, stop, lg) = (stats.clone(), report.clone(), log);
+            let (st, stop, lg) = (stats.clone(), report.clone(), log.clone());
             std::thread::spawn(move || {
                 let mut n = 0;
                 while !stop.load(Ordering::SeqCst) {
@@ -318,6 +335,7 @@ impl Engine {
                 }
             });
         }
+        crate::fee::spawn(route, stats.clone(), report.clone(), log.clone());
         Engine { backend: Some(backend), stats, report }
     }
 

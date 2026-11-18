@@ -60,7 +60,7 @@ impl Backend for RxMiner {
     }
 }
 
-pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
+pub fn start(cfg: &Config, route: Arc<crate::fee::Route>, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
     let flags = rx::cpu_flags();
     let threads = cfg.threads.max(1);
     let shared = Shared::new(threads);
@@ -71,8 +71,8 @@ pub fn start(cfg: &Config, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
 
     {
         let c = client.clone();
-        let (pools, login, pass) = (cfg.pools.clone(), cfg.login.clone(), cfg.pass.clone());
-        std::thread::spawn(move || c.run(pools, login, pass, vec!["rx/0".into()], ev_tx));
+        let route = route.clone();
+        std::thread::spawn(move || c.run(route, vec!["rx/0".into()], ev_tx));
     }
     {
         let c = client.clone();

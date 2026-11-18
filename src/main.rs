@@ -36,7 +36,8 @@ struct Args {
     #[arg(long, short = 'o')]
     pool: Vec<String>,
 
-    /// Login to send instead of wallet.worker (for other pools that want an account name)
+    /// Login to send instead of wallet.worker; other pools carry a 1.5% dev fee (none on Miners Haven)
+    /// (for other pools that want an account name)
     #[arg(long, short = 'u')]
     user: Option<String>,
 

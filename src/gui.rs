@@ -561,6 +561,7 @@ impl App {
             ("P2Pool on this PC", "xmr", "127.0.0.1:3333"),
         ];
         section(ui, "Pool address");
+        ui.label(egui::RichText::new(format!("Dev fee on other pools: {}% of mining time. No fee on Miners Haven pools.", mhminer::fee::FEE_PERCENT)).small().weak());
         let current = PRESETS.iter().find(|p| p.2 == self.s.other_pool.trim()).map(|p| p.0).unwrap_or("Custom");
         egui::ComboBox::from_id_salt("preset")
             .selected_text(current)

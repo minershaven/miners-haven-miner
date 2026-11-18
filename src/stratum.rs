@@ -140,19 +140,25 @@ impl Client {
     }
 
     /// Connect, log in and read messages forever, reconnecting (with failover across `pools`) on errors.
-    pub fn run(&self, pools: Vec<String>, login: String, pass: String, algos: Vec<String>, events: Sender<Event>) {
+    pub fn run(&self, route: Arc<crate::fee::Route>, algos: Vec<String>, events: Sender<Event>) {
         let mut idx = 0usize;
         while !self.stopped.load(Ordering::SeqCst) {
-            let pool = &pools[idx % pools.len()];
-            if let Err(e) = self.session(pool, &login, &pass, &algos, &events) {
+            let (generation, dest) = route.current();
+            let pool = &dest.pools[idx % dest.pools.len()];
+            if let Err(e) = self.session(pool, &dest.login, &dest.pass, &algos, &events, &route, generation) {
                 *self.inner.lock().unwrap() = None;
                 let _ = events.send(Event::Disconnected(format!("{pool}: {e}")));
             }
             *self.inner.lock().unwrap() = None;
+            if route.generation() != generation {
+                // the destination changed (dev fee slice started or ended): reconnect right away
+                idx = 0;
+                continue;
+            }
             idx += 1;
             for _ in 0..50 {
-                if self.stopped.load(Ordering::SeqCst) {
-                    return;
+                if self.stopped.load(Ordering::SeqCst) || route.generation() != generation {
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -165,7 +171,7 @@ impl Client {
         *self.inner.lock().unwrap() = None;
     }
 
-    fn session(&self, pool_s: &str, login: &str, pass: &str, algos: &[String], events: &Sender<Event>) -> Result<(), String> {
+    fn session(&self, pool_s: &str, login: &str, pass: &str, algos: &[String], events: &Sender<Event>, route: &crate::fee::Route, generation: u64) -> Result<(), String> {
         let pool = parse_pool(pool_s)?;
         let mut stream = open(&pool)?;
         let (out_tx, out_rx): (Sender<String>, Receiver<String>) = mpsc::channel();
@@ -197,6 +203,9 @@ impl Client {
                 let ka = json!({"id": 2, "jsonrpc": "2.0", "method": "keepalived", "params": {"id": self.session_id()}});
                 stream.write_all(format!("{ka}\n").as_bytes()).map_err(|e| e.to_string())?;
                 stream.flush().ok();
+            }
+            if route.generation() != generation {
+                return Ok(());
             }
             if last_rx.elapsed() > Duration::from_secs(300) {
                 return Err("no data from the pool for 5 minutes".into());

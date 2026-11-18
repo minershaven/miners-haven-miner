@@ -1,4 +1,4 @@
-Miners Haven Miner 2.3  -  theminershaven.org
+Miners Haven Miner 2.4  -  theminershaven.org
 =============================================
 
 COINS
@@ -11,6 +11,12 @@ DESKTOP APP
   Double-click MinersHavenMiner.exe. Pick a coin, paste your wallet address and press
   START MINING. For GPU coins, tick the graphics cards to use. Settings are remembered.
   Pool: "Miners Haven" picks the right port for you; "Other pool" mines anywhere.
+
+DEV FEE
+  Mining on Miners Haven pools is free: no dev fee at all.
+  On any other pool the miner works for the developer for 1.5% of the time (90 seconds
+  in every 100 minutes, the first after 15 minutes). The log shows "dev fee" lines when
+  it starts and ends, and shares found in that time are not counted in your totals.
   Location: Auto (fastest), US (St. Louis) or EU (Germany); the other server is the backup.
   GPU coins show each card's speed, temperature, fan and power.
 
