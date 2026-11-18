@@ -2,6 +2,7 @@
 //! (`nvcuda.dll` / `libcuda.so.1`). Nothing from NVIDIA's toolkit is needed or shipped: kernels
 //! are PTX text built ahead of time (see `kernels/`), which the driver compiles for the card.
 
+pub mod pearl_gpu;
 pub mod probe;
 
 use libloading::{Library, Symbol};

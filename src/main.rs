@@ -122,8 +122,18 @@ fn main() {
                 println!(" benchmark QPoW: CPU {} with {threads} threads, GPU {}", hr(rate), hr(g));
             }
             engine::Algo::Pearl => {
-                let rate = mhminer::pearlminer::bench(threads.max(1), secs);
-                println!(" benchmark pearlhash: CPU {} with {threads} threads", hr(rate));
+                let cards = mhminer::cuda::devices();
+                for d in &cards {
+                    println!(" GPU{}  {}  {:.1} GB", d.index, d.name, d.memory as f64 / 1073741824.0);
+                    match mhminer::pearlminer::bench_gpu(d.index, secs, &log) {
+                        Ok(rate) => println!(" benchmark pearlhash: GPU{} {}", d.index, hr(rate)),
+                        Err(e) => println!(" GPU{}: {e}", d.index),
+                    }
+                }
+                if cards.is_empty() || args.threads.is_some() {
+                    let rate = mhminer::pearlminer::bench(threads.max(1), secs);
+                    println!(" benchmark pearlhash: CPU {} with {threads} threads", hr(rate));
+                }
             }
             a => {
                 for g in gpu::list_gpus() {

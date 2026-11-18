@@ -68,8 +68,17 @@ fn difficulty_of(target_hex: &str) -> f64 {
 }
 
 pub fn start(cfg: &Config, route: Arc<crate::fee::Route>, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
-    let threads = cfg.threads.max(1);
-    log(&format!("CPU: {threads} threads  (Pearl on the graphics card is not built yet, so this is slow)"));
+    // NVIDIA cards with int8 tensor cores (RTX 30 series and newer) run the fast path
+    let cards: Vec<crate::cuda::Device> = if cfg.gpus == vec![usize::MAX] { vec![] } else {
+        crate::cuda::devices().into_iter().filter(|d| d.capability.0 >= 8).collect()
+    };
+    let threads = if cards.is_empty() { cfg.threads.max(1) } else { 0 };
+    for d in &cards {
+        log(&format!("GPU{} {}  ({:.1} GB)", d.index, d.name, d.memory as f64 / 1073741824.0));
+    }
+    if threads > 0 {
+        log(&format!("CPU: {threads} threads  (no NVIDIA RTX card found; Pearl on the processor is slow)"));
+    }
     let shared = Arc::new(Shared {
         job: RwLock::new(None),
         job_gen: AtomicU64::new(0),
@@ -82,9 +91,15 @@ pub fn start(cfg: &Config, route: Arc<crate::fee::Route>, stats: Arc<Stats>, log
         let (sh, st, lg) = (shared.clone(), stats.clone(), log.clone());
         handles.push(std::thread::spawn(move || connection(route, sh, st, lg)));
     }
-    {
+    if threads > 0 {
         let (sh, lg) = (shared.clone(), log.clone());
         handles.push(std::thread::spawn(move || mine(threads, sh, lg)));
+    }
+    for d in cards {
+        let (sh, lg, st) = (shared.clone(), log.clone(), stats.clone());
+        if let Ok(h) = std::thread::Builder::new().stack_size(32 << 20).spawn(move || gpu_mine(d, sh, st, lg)) {
+            handles.push(h);
+        }
     }
     {
         let sh = shared.clone();
@@ -296,4 +311,130 @@ pub fn bench(threads: usize, secs: u64) -> f64 {
         total += done.load(Ordering::Relaxed);
     }
     total as f64 / t0.elapsed().as_secs_f64()
+}
+
+/// Matrix sizes for a graphics-card round. B is kept for a whole block, so it can be large;
+/// A is re-keyed every round on the processor, so it is kept smaller.
+pub const GM: usize = 4096;
+pub const GN: usize = 65536;
+
+/// Benchmark the graphics card for `secs` seconds without a pool. Returns (hashrate, report).
+pub fn bench_gpu(index: usize, secs: u64, log: &Log) -> Result<f64, String> {
+    let mut gpu = crate::cuda::pearl_gpu::PearlGpu::open(index)?;
+    log("GPU self-check passed: products and hashes match the processor");
+    let cfg = pearl::config(K);
+    let header = pearl::Header { version: 0x2040_0000, prev_block: [1; 32], merkle_root: [2; 32], timestamp: 1_800_000_000, nbits: 0x1b01_4f8a };
+    let t = Instant::now();
+    // development: MH_PEARL_MN="m,n" tries other matrix sizes
+    let (gm, gn) = std::env::var("MH_PEARL_MN").ok().and_then(|v| { let p: Vec<usize> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect(); (p.len() == 2 && p[0] % 128 == 0 && p[1] % 256 == 0).then(|| (p[0], p[1])) }).unwrap_or((GM, GN));
+    let job = pearl::GpuJob::new(&header, cfg, gm, gn, SeedDerivation::Salted, salt()).ok_or("noise out of range")?;
+    gpu.set_b(&job)?;
+    log(&format!("matrices for a block prepared in {:.1}s  (A {} x {}, B {} x {})", t.elapsed().as_secs_f64(), gm, K, K, gn));
+    let work = (gm as u64 * gn as u64) * K as u64;
+    let (t0, mut rounds, mut prep, mut run) = (Instant::now(), 0u64, 0.0, 0.0);
+    while t0.elapsed() < Duration::from_secs(secs) {
+        let t = Instant::now();
+        let round = job.round(rounds + 1).ok_or("noise out of range")?;
+        prep += t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let _ = gpu.scan(&job, &round, &U256::zero())?;
+        run += t.elapsed().as_secs_f64();
+        rounds += 1;
+    }
+    let total = t0.elapsed().as_secs_f64();
+    log(&format!("{rounds} rounds: preparing A {:.0} ms each on the processor, multiplying {:.0} ms each on the GPU", prep * 1000.0 / rounds as f64, run * 1000.0 / rounds as f64));
+    log(&format!("of the GPU time: loading A {:.1} ms, kernel {:.1} ms  (kernel alone {})", gpu.load_time * 1000.0 / rounds as f64, gpu.kernel_time * 1000.0 / rounds as f64, crate::engine::hr(rounds as f64 * work as f64 / gpu.kernel_time)));
+    log(&format!("GPU alone: {}   overall: {}", crate::engine::hr(rounds as f64 * work as f64 / run), crate::engine::hr(rounds as f64 * work as f64 / total)));
+    Ok(rounds as f64 * work as f64 / total)
+}
+
+/// One card: keep B for the current block, and scan one keying of A after another. The next
+/// keying is prepared on another thread while the card multiplies the current one.
+fn gpu_mine(dev: crate::cuda::Device, sh: Arc<Shared>, stats: Arc<Stats>, log: Log) {
+    let name = format!("GPU{}", dev.index);
+    let mut gpu = match crate::cuda::pearl_gpu::PearlGpu::open(dev.index) {
+        Ok(g) => g,
+        Err(e) => {
+            log(&format!("{name}: {e}"));
+            return;
+        }
+    };
+    log(&format!("{name}: self-check passed (products and hashes match the processor)"));
+    let cfg = pearl::config(K);
+    let work = (GM as u64 * GN as u64) * K as u64;
+    let mut bad = 0u32;
+    while !sh.stop.load(Ordering::SeqCst) {
+        let Some(first) = sh.job.read().unwrap().clone() else {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+        let header = first.header.to_bytes();
+        let t = Instant::now();
+        let Some(job) = pearl::GpuJob::new(&first.header, cfg, GM, GN, SeedDerivation::Salted, salt()) else {
+            log(&format!("{name}: noise out of range, retrying"));
+            continue;
+        };
+        let job = Arc::new(job);
+        if let Err(e) = gpu.set_b(&job) {
+            log(&format!("{name}: {e}"));
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+        log(&format!("{name}: matrices for this block ready in {:.1}s", t.elapsed().as_secs_f64()));
+        // keyings of A, two ahead at most
+        let (tx, rx) = mpsc::sync_channel::<pearl::GpuRound>(2);
+        let (pj, pstop) = (job.clone(), sh.stop.clone());
+        let prep = std::thread::spawn(move || {
+            let mut counter = 0u64;
+            while !pstop.load(Ordering::Relaxed) {
+                counter += 1;
+                let Some(r) = pj.round(counter) else { continue };
+                if tx.send(r).is_err() {
+                    break;
+                }
+            }
+        });
+        let (mut t_rate, mut done) = (Instant::now(), 0u64);
+        loop {
+            if sh.stop.load(Ordering::SeqCst) {
+                break;
+            }
+            // a new target on the same block keeps the matrices; a new block needs new ones
+            let Some(cur) = sh.job.read().unwrap().clone() else { break };
+            if cur.header.to_bytes() != header {
+                break;
+            }
+            let Ok(round) = rx.recv() else { break };
+            let hits = match gpu.scan(&job, &round, &cur.bound) {
+                Ok(h) => h,
+                Err(e) => {
+                    log(&format!("{name}: {e}"));
+                    std::thread::sleep(Duration::from_secs(5));
+                    break;
+                }
+            };
+            sh.hashes.fetch_add(work, Ordering::Relaxed);
+            done += work;
+            if t_rate.elapsed() > Duration::from_secs(2) {
+                let rate = done as f64 / t_rate.elapsed().as_secs_f64();
+                *stats.devices.lock().unwrap() = vec![format!("{name} {}   {:>11}", dev.name, crate::engine::hr(rate))];
+                (t_rate, done) = (Instant::now(), 0);
+            }
+            for (ri, ci) in hits {
+                // every result is recomputed on the processor before it is sent
+                if !job.wins(&round, ri, ci, &cur.bound) {
+                    bad += 1;
+                    log(&format!("{name}: result failed the CPU check ({bad} so far) - lower the GPU overclock if this repeats"));
+                    continue;
+                }
+                let Some(proof) = pearl::encode(&job.proof(round.counter, ri, ci)) else { continue };
+                let body = json!({"job_id": cur.id, "plain_proof": proof}).to_string();
+                if let Some(out) = sh.out.lock().unwrap().as_ref() {
+                    let _ = out.send(body);
+                }
+            }
+        }
+        drop(rx);
+        let _ = prep.join();
+    }
 }

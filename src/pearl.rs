@@ -207,6 +207,143 @@ impl Round {
     }
 }
 
+/// Matrices for the graphics-card path. B is committed once per block header and kept; each
+/// round re-keys A by changing a few of its cells, which gives it a fresh noise seed (and so a
+/// fresh set of products) without touching B.
+pub struct GpuJob {
+    pub m: usize,
+    pub n: usize,
+    pub k: usize,
+    cfg: MiningConfiguration,
+    seeds: SeedDerivation,
+    job_key: [u8; 32],
+    a: Vec<i8>,
+    bt: Vec<i8>,
+    hash_b: [u8; 32],
+    b_noise_seed: [u8; 32],
+    /// B transposed with noise (n x k), as the kernel reads it
+    pub btn: Vec<i8>,
+}
+
+/// One keying of A.
+pub struct GpuRound {
+    /// which keying of A this is
+    pub counter: u64,
+    pub a_noise_seed: [u8; 32],
+    /// A with noise (m x k)
+    pub an: Vec<i8>,
+}
+
+fn as_u8(v: &[i8]) -> &[u8] {
+    // i8 and u8 have the same layout
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) }
+}
+
+/// signal + noise, which the protocol keeps inside int8
+fn add_noise(sig: &[i8], noise: &[Vec<i8>], k: usize) -> Option<Vec<i8>> {
+    let mut out = Vec::with_capacity(sig.len());
+    for (s, nz) in sig.chunks(k).zip(noise) {
+        for (&x, &y) in s.iter().zip(nz) {
+            out.push(i8::try_from(x as i16 + y as i16).ok()?);
+        }
+    }
+    Some(out)
+}
+
+impl GpuJob {
+    pub fn new(header: &IncompleteBlockHeader, cfg: MiningConfiguration, m: usize, n: usize, seeds: SeedDerivation, seed: u64) -> Option<GpuJob> {
+        let k = cfg.common_dim as usize;
+        let mut rng = Xs(seed | 1);
+        let a = rng.signal(m * k);
+        let bt = rng.signal(n * k);
+        let mut data = Vec::with_capacity(128);
+        data.extend_from_slice(&header.to_bytes());
+        data.extend_from_slice(&cfg.to_bytes());
+        let job_key = blake3_digest(&data, None);
+        let raw_b = blake3_digest(&pad_to_chunk_boundary(as_u8(&bt)), Some(job_key));
+        // binding A's root needs m only, B's needs n only
+        let hash_b = seeds.bind_roots(&[0; 32], &raw_b, m as u32, n as u32).1;
+        let b_noise_seed = blake3_digest(&[&job_key[..], &hash_b[..]].concat(), None);
+        let cols: Vec<usize> = (0..n).collect();
+        let noise = compute_noise_for_indices(k, RANK, (b_noise_seed, [0; 32]), &[], &cols);
+        let btn = add_noise(&bt, &noise.b, k)?;
+        Some(GpuJob { m, n, k, cfg, seeds, job_key, a, bt, hash_b, b_noise_seed, btn })
+    }
+
+    /// A as keying `counter` commits to it: the counter is written into its first cells.
+    fn keyed_a(&self, counter: u64) -> Vec<i8> {
+        let mut a = self.a.clone();
+        for (i, cell) in a.iter_mut().take(8).enumerate() {
+            *cell = ((counter >> (6 * i)) & 63) as i8 - 32;
+        }
+        a
+    }
+
+    /// Keying `counter` of A, with its noise. Safe to prepare on another thread while the
+    /// card works on the previous one.
+    pub fn round(&self, counter: u64) -> Option<GpuRound> {
+        let a = self.keyed_a(counter);
+        let raw_a = blake3_digest(&pad_to_chunk_boundary(as_u8(&a)), Some(self.job_key));
+        let hash_a = self.seeds.bind_roots(&raw_a, &[0; 32], self.m as u32, self.n as u32).0;
+        let a_noise_seed = blake3_digest(&[&self.b_noise_seed[..], &hash_a[..]].concat(), None);
+        let rows: Vec<usize> = (0..self.m).collect();
+        let noise = compute_noise_for_indices(self.k, RANK, (self.b_noise_seed, a_noise_seed), &rows, &[]);
+        Some(GpuRound { counter, a_noise_seed, an: add_noise(&a, &noise.a, self.k)? })
+    }
+
+    /// Rows of A in row tile `ri` and columns of B in column tile `ci`.
+    pub fn tile(&self, ri: usize, ci: usize) -> (Vec<usize>, Vec<usize>) {
+        let rows = self.cfg.rows_pattern.to_list().iter().map(|&d| (ri / 8) * 16 + ri % 8 + d as usize).collect();
+        let cols = self.cfg.cols_pattern.to_list().iter().map(|&d| (ci / 4) * 256 + 2 * (ci % 4) + d as usize).collect();
+        (rows, cols)
+    }
+
+    /// The jackpot words and hash of one tile, computed on the processor.
+    pub fn jackpot(&self, round: &GpuRound, ri: usize, ci: usize) -> ([u32; JACKPOT_SIZE], [u8; 32]) {
+        let k = self.k;
+        let (rows, cols) = self.tile(ri, ci);
+        let mut acc = vec![0i32; rows.len() * cols.len()];
+        let mut jackpot = [0u32; JACKPOT_SIZE];
+        for c in 0..k / RANK {
+            let (lo, hi) = (c * RANK, (c + 1) * RANK);
+            let mut x = 0u32;
+            for (u, &ar) in rows.iter().enumerate() {
+                let av = &round.an[ar * k + lo..ar * k + hi];
+                for (v, &bc) in cols.iter().enumerate() {
+                    let bv = &self.btn[bc * k + lo..bc * k + hi];
+                    let d: i32 = av.iter().zip(bv).map(|(&p, &q)| p as i32 * q as i32).sum();
+                    let s = &mut acc[u * cols.len() + v];
+                    *s = s.wrapping_add(d);
+                    x ^= *s as u32;
+                }
+            }
+            let t = c % JACKPOT_SIZE;
+            jackpot[t] = jackpot[t].rotate_left(LROT_PER_TILE) ^ x;
+        }
+        (jackpot, compute_jackpot_hash(&jackpot, round.a_noise_seed))
+    }
+
+    /// Does this tile beat `bound`? (The check every GPU result gets before it is sent.)
+    pub fn wins(&self, round: &GpuRound, ri: usize, ci: usize, bound: &U256) -> bool {
+        U256::from_little_endian(&self.jackpot(round, ri, ci).1) <= *bound
+    }
+
+    /// The proof for a winning tile of keying `counter` of A.
+    pub fn proof(&self, counter: u64, ri: usize, ci: usize) -> PlainProof {
+        let (rows, cols) = self.tile(ri, ci);
+        let build = |mat: &[i8], total: usize, idx: &[usize]| -> MatrixMerkleProof {
+            let tree = MerkleTree::new(&pad_to_chunk_boundary(as_u8(mat)), self.job_key);
+            let leaves = MerkleTree::compute_leaf_indices_from_rows(idx, (total, self.k));
+            MatrixMerkleProof { proof: tree.get_multileaf_proof(&leaves), row_indices: idx.to_vec() }
+        };
+        PlainProof { m: self.m, n: self.n, k: self.k, noise_rank: RANK, a: build(&self.keyed_a(counter), self.m, &rows), bt: build(&self.bt, self.n, &cols), moe: None }
+    }
+
+    pub fn hash_b(&self) -> [u8; 32] {
+        self.hash_b
+    }
+}
+
 /// The proof as pools take it: the binary form, base64.
 pub fn encode(proof: &PlainProof) -> Option<String> {
     use base64::Engine as _;
@@ -237,6 +374,24 @@ mod tests {
             verify_plain_proof(&h, &proof, None, seeds).expect("Pearl's verifier accepts our proof");
             assert!(encode(&proof).unwrap().len() > 1000);
         }
+    }
+
+    #[test]
+    fn gpu_job_rounds_make_valid_proofs() {
+        let h = header();
+        let cfg = config(2048);
+        let job = GpuJob::new(&h, cfg, 32, 512, SeedDerivation::Salted, 77).expect("noise fits int8");
+        let bound = extract_difficulty_bound(h.nbits, &cfg);
+        let mut seeds = Vec::new();
+        for counter in [1u64, 2, 70_000] {
+            let round = job.round(counter).expect("noise fits int8");
+            seeds.push(round.a_noise_seed);
+            // every tile position maps to the rows and columns the reference lists
+            assert_eq!(job.tile(9, 5), (vec![17, 25], cols_pattern_list().iter().map(|&d| 256 + 2 + d as usize).collect()));
+            let (ri, ci) = (0..16).flat_map(|r| (0..8).map(move |c| (r, c))).find(|&(r, c)| job.wins(&round, r, c, &bound)).expect("an easy target has a winner");
+            verify_plain_proof(&h, &job.proof(counter, ri, ci), None, SeedDerivation::Salted).expect("Pearl's verifier accepts a GPU-path proof");
+        }
+        assert!(seeds[0] != seeds[1] && seeds[1] != seeds[2], "each round gets a new seed");
     }
 
     #[test]
