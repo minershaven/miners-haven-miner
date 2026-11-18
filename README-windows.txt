@@ -1,4 +1,4 @@
-Miners Haven Miner 2.4  -  theminershaven.org
+Miners Haven Miner 2.5  -  theminershaven.org
 =============================================
 
 COINS
@@ -10,7 +10,8 @@ COINS
 DESKTOP APP
   Double-click MinersHavenMiner.exe. Pick a coin, paste your wallet address and press
   START MINING. For GPU coins, tick the graphics cards to use. Settings are remembered.
-  Pool: "Miners Haven" picks the right port for you; "Other pool" mines anywhere.
+  Pool: "Miners Haven" picks the right port for you. "Other pool" mines anywhere: choose the
+  algorithm, then fill in the pool address, your wallet (or username) and the password.
 
 DEV FEE
   Mining on Miners Haven pools is free: no dev fee at all.

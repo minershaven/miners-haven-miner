@@ -2,7 +2,7 @@
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
+use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Margin, RichText, Stroke};
 use mhminer::engine::{self, hr, Config, Engine, Log};
 use mhminer::hugepages::{self, Status};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,22 @@ const ACCENT_FILL: Color32 = Color32::from_rgb(0x0f, 0x76, 0x6e);
 const GREEN: Color32 = Color32::from_rgb(0x22, 0xc5, 0x5e);
 const RED: Color32 = Color32::from_rgb(0xef, 0x44, 0x44);
 const WARN: Color32 = Color32::from_rgb(0xf5, 0x9e, 0x0b);
-const BLUE: Color32 = Color32::from_rgb(0x3b, 0x82, 0xf6);
+const INPUT: Color32 = Color32::from_rgb(0x07, 0x0d, 0x1a);
+const SOFT: Color32 = Color32::from_rgb(0xb8, 0xc2, 0xd6);
+
+/// Algorithms offered for other pools: (settings id, algorithm, label)
+const ALGOS: [(&str, engine::Algo, &str); 5] = [
+    ("randomx", engine::Algo::RandomX, "RandomX  -  CPU  (Monero, QRL)"),
+    ("kawpow", engine::Algo::KawPow, "KawPoW  -  GPU  (Ravencoin, Neoxa)"),
+    ("firopow", engine::Algo::FiroPow, "FiroPoW  -  GPU  (Firo)"),
+    ("progpowz", engine::Algo::ProgPowZ, "ProgPowZ  -  GPU  (Zano)"),
+    ("qpow", engine::Algo::QPow, "QPoW  -  GPU + CPU  (Quantus)"),
+];
+
+/// Semibold text at this size.
+fn sb(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("sb".into()))
+}
 
 const SITE: &str = "https://theminershaven.org";
 
@@ -51,6 +66,8 @@ struct Settings {
     gpus: Vec<usize>,
     /// "auto", "us" or "eu"
     region: String,
+    /// algorithm id (see ALGOS) used with "Other pool"
+    other_algo: String,
 }
 
 impl Default for Settings {
@@ -73,6 +90,7 @@ impl Default for Settings {
             other_pass: String::new(),
             gpus: Vec::new(),
             region: "auto".into(),
+            other_algo: String::new(),
         }
     }
 }
@@ -110,6 +128,14 @@ impl Settings {
         if s.pool_mode != "other" {
             s.pool_mode = "mh".into();
         }
+        // "Other pool" used to borrow the coin picker and the coin's wallet box
+        if !ALGOS.iter().any(|a| a.0 == s.other_algo) {
+            let algo = engine::coin(&s.coin).map(|c| c.algo).unwrap_or(engine::Algo::RandomX);
+            s.other_algo = ALGOS.iter().find(|a| a.1 == algo).map(|a| a.0).unwrap_or("randomx").into();
+        }
+        if s.other_user.trim().is_empty() {
+            s.other_user = s.wallets.get(&s.coin).cloned().unwrap_or_default();
+        }
         s
     }
     fn other(&self) -> bool {
@@ -135,6 +161,14 @@ impl Settings {
     }
     fn coin(&self) -> &'static engine::Coin {
         engine::coin(&self.coin).unwrap_or(&engine::COINS[0])
+    }
+    /// The algorithm to mine: the coin's on Miners Haven, the chosen one on other pools.
+    fn algo(&self) -> engine::Algo {
+        if self.other() {
+            ALGOS.iter().find(|a| a.0 == self.other_algo).map(|a| a.1).unwrap_or(engine::Algo::RandomX)
+        } else {
+            self.coin().algo
+        }
     }
 }
 
@@ -200,59 +234,63 @@ impl App {
 
     fn start(&mut self) {
         self.error = None;
-        let wallet = self.s.wallet().trim().to_string();
-        if wallet.is_empty() {
-            self.error = Some(format!("Enter your {} wallet address first.", self.s.coin().symbol));
-            return;
-        }
-        let worker = self.s.worker.trim().replace(['.', ' '], "-");
+        let algo = self.s.algo();
+        let name = if self.s.other() { algo.name().to_string() } else { self.s.coin().symbol.to_string() };
         let (pools, login, pass): (Vec<String>, String, String) = if self.s.other() {
             let pools: Vec<String> = self.s.other_pool.split([',', ' ']).filter(|p| !p.is_empty()).map(String::from).collect();
             if pools.is_empty() {
-                self.error = Some("Enter the pool address (host:port), or pick one from the list.".into());
+                self.error = Some("Enter the pool address (host:port).".into());
                 return;
             }
             if let Some(e) = pools.iter().find_map(|p| mhminer::stratum::parse_pool(p).err()) {
                 self.error = Some(e);
                 return;
             }
-            let user = self.s.other_user.trim();
-            let login = if user.is_empty() { wallet } else { user.to_string() };
+            let login = self.s.other_user.trim().to_string();
+            if login.is_empty() {
+                self.error = Some("Enter your wallet address (or the username the pool gave you).".into());
+                return;
+            }
             let pass = self.s.other_pass.trim();
-            let pass = if !pass.is_empty() { pass.to_string() } else if !worker.is_empty() { worker.clone() } else { "x".into() };
-            (pools, login, pass)
+            (pools, login, if pass.is_empty() { "x".into() } else { pass.to_string() })
         } else {
+            let wallet = self.s.wallet().trim().to_string();
+            if wallet.is_empty() {
+                self.error = Some(format!("Enter your {name} wallet address first."));
+                return;
+            }
             if let Some(w) = wallet_warning(&self.s.coin, &wallet) {
                 self.error = Some(w);
                 return;
             }
+            let worker = self.s.worker.trim().replace(['.', ' '], "-");
             let login = if worker.is_empty() { wallet } else { format!("{wallet}.{worker}") };
             let pings = self.pings.lock().unwrap().clone().filter(|p| p.0 == self.s.coin).map(|p| (p.1, p.2));
             let pools = engine::pool_list(&self.s.coin, self.s.solo, self.s.large, engine::Region::parse(&self.s.region), pings);
             (pools, login, "x".into())
         };
-        if self.s.coin().algo.gpu() && self.gpus.is_empty() {
-            self.error = Some(format!("{} is mined on a graphics card, and no OpenCL GPU was found. Install the latest NVIDIA or AMD driver.", self.s.coin().symbol));
+        if algo.gpu() && self.gpus.is_empty() {
+            self.error = Some(format!("{name} is mined on a graphics card, and no OpenCL GPU was found. Install the latest NVIDIA or AMD driver."));
             return;
         }
         // empty = all GPUs; [usize::MAX] = none ticked
         let none_ticked = self.s.gpus == vec![usize::MAX] || (!self.s.gpus.is_empty() && !self.s.gpus.iter().any(|i| self.gpus.iter().any(|g| g.index == *i)));
-        if self.s.coin().algo.gpu() && none_ticked {
+        if algo.gpu() && none_ticked {
             self.error = Some("Tick at least one graphics card.".into());
             return;
         }
-        let gpu_capable = self.s.coin().algo.gpu_capable() && !self.gpus.is_empty();
-        if self.s.coin().algo == engine::Algo::QPow && (none_ticked || !gpu_capable) && self.s.threads == 0 {
+        let gpu_capable = algo.gpu_capable() && !self.gpus.is_empty();
+        if algo == engine::Algo::QPow && (none_ticked || !gpu_capable) && self.s.threads == 0 {
             self.error = Some("Pick at least one CPU thread or a graphics card.".into());
             return;
         }
         let gpus: Vec<usize> = if none_ticked { vec![usize::MAX] } else { self.s.gpus.clone() };
-        let cfg = Config { algo: self.s.coin().algo, pools: pools.clone(), login, pass, threads: self.s.threads, light: self.s.light, gpus };
+        let cfg = Config { algo, pools: pools.clone(), login, pass, threads: self.s.threads, light: self.s.light, gpus };
         self.s.save();
         let what = if self.s.other() { "other pool".to_string() } else { if self.s.solo { "SOLO" } else { "PPLNS" }.to_string() };
-        let c = self.s.coin();
-        let dev = if c.algo.gpu() { "GPU".to_string() } else if c.algo.gpu_capable() && !self.gpus.is_empty() { format!("GPU + {} CPU threads", self.s.threads) } else { format!("{} CPU threads", self.s.threads) };
-        self.log(&format!("starting {} - {} ({what}) on {} with {dev}", c.symbol, c.algo.name(), pools.join(", ")));
+        let dev = if algo.gpu() { "GPU".to_string() } else if gpu_capable { format!("GPU + {} CPU threads", self.s.threads) } else { format!("{} CPU threads", self.s.threads) };
+        let detail = if self.s.other() { String::new() } else { format!(" - {}", algo.name()) };
+        self.log(&format!("starting {name}{detail} ({what}) on {} with {dev}", pools.join(", ")));
         self.engine = Some(Engine::start(cfg, self.logger()));
     }
 
@@ -280,46 +318,113 @@ fn wallet_warning(coin: &str, w: &str) -> Option<String> {
 }
 
 fn style(ctx: &egui::Context) {
+    // Inter: regular for text, semibold (family "sb") for headings and figures
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("inter".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-Regular.otf"))));
+    fonts.font_data.insert("inter-sb".into(), Arc::new(egui::FontData::from_static(include_bytes!("../assets/fonts/Inter-SemiBold.otf"))));
+    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "inter".into());
+    let mut semibold = vec!["inter-sb".to_string()];
+    semibold.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+    fonts.families.insert(FontFamily::Name("sb".into()), semibold);
+    ctx.set_fonts(fonts);
+
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
-    v.window_fill = SURFACE;
-    v.extreme_bg_color = Color32::from_rgb(0x07, 0x0d, 0x1a);
+    v.window_fill = RAISED;
+    v.window_stroke = Stroke::new(1.0, BORDER);
+    v.window_corner_radius = CornerRadius::same(10);
+    v.menu_corner_radius = CornerRadius::same(10);
+    v.extreme_bg_color = INPUT;
     v.faint_bg_color = SURFACE;
     v.override_text_color = Some(TEXT);
     v.selection.bg_fill = ACCENT_FILL;
     v.selection.stroke = Stroke::new(1.0, ACCENT);
     v.hyperlink_color = ACCENT;
+    let r = CornerRadius::same(8);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    v.widgets.noninteractive.corner_radius = r;
     v.widgets.inactive.bg_fill = RAISED;
     v.widgets.inactive.weak_bg_fill = RAISED;
     v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    v.widgets.inactive.corner_radius = r;
+    v.widgets.hovered.bg_fill = Color32::from_rgb(0x16, 0x24, 0x40);
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(0x16, 0x24, 0x40);
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_FILL);
+    v.widgets.hovered.corner_radius = r;
+    v.widgets.active.bg_fill = ACCENT_FILL;
     v.widgets.active.weak_bg_fill = ACCENT_FILL;
+    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
+    v.widgets.active.corner_radius = r;
+    v.widgets.open.weak_bg_fill = RAISED;
+    v.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT_FILL);
+    v.widgets.open.corner_radius = r;
     ctx.set_theme(egui::Theme::Dark);
     ctx.set_visuals_of(egui::Theme::Dark, v);
     ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 8.0);
-        s.spacing.button_padding = egui::vec2(10.0, 6.0);
-        s.spacing.interact_size.y = 28.0;
+        s.spacing.button_padding = egui::vec2(12.0, 7.0);
+        s.spacing.interact_size.y = 32.0;
+        s.spacing.icon_width = 18.0;
+        s.spacing.combo_height = 320.0;
+        s.text_styles.insert(egui::TextStyle::Body, FontId::proportional(13.5));
+        s.text_styles.insert(egui::TextStyle::Button, FontId::proportional(13.5));
+        s.text_styles.insert(egui::TextStyle::Small, FontId::proportional(11.5));
+        s.text_styles.insert(egui::TextStyle::Monospace, FontId::monospace(12.5));
     });
 }
 
+/// Small caps label above a group of controls.
 fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(6.0);
-    ui.label(RichText::new(title.to_uppercase()).size(11.0).color(MUTED).strong());
+    ui.add_space(8.0);
+    ui.label(RichText::new(title.to_uppercase()).font(sb(10.5)).color(MUTED).extra_letter_spacing(0.7));
+    ui.add_space(-3.0);
+}
+
+/// Small grey help text under a control.
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(-3.0);
+    ui.label(RichText::new(text).size(11.5).color(MUTED));
+}
+
+/// A full-width one-line text box.
+fn input(ui: &mut egui::Ui, text: &mut String, placeholder: &str) -> egui::Response {
+    ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY).margin(Margin::symmetric(10, 8))
+        .hint_text(RichText::new(placeholder).color(Color32::from_rgb(0x45, 0x53, 0x6c))))
+}
+
+/// A row of equal-width choices, one selected. Labels may have a second line.
+fn segmented<T: PartialEq + Clone>(ui: &mut egui::Ui, value: &mut T, items: &[(T, String, bool)], height: f32) {
+    egui::Frame::new().fill(INPUT).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(9)).inner_margin(Margin::same(3))
+        .show(ui, |ui| {
+            let gap = 3.0;
+            let w = ((ui.available_width() - gap * (items.len() as f32 - 1.0)) / items.len() as f32).floor();
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = gap;
+                for (id, label, enabled) in items {
+                    let sel = value == id;
+                    let text = RichText::new(label).font(if sel { sb(13.0) } else { FontId::proportional(13.0) })
+                        .color(if sel { Color32::WHITE } else { SOFT });
+                    let b = egui::Button::new(text).fill(if sel { ACCENT_FILL } else { Color32::TRANSPARENT })
+                        .stroke(Stroke::NONE).corner_radius(CornerRadius::same(7)).min_size(egui::vec2(w, height));
+                    if ui.add_enabled(*enabled, b).clicked() {
+                        *value = id.clone();
+                    }
+                }
+            });
+        });
 }
 
 fn card(ui: &mut egui::Ui, label: &str, value: String, color: Color32) {
     egui::Frame::new()
         .fill(SURFACE)
         .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(14, 10))
+        .corner_radius(CornerRadius::same(12))
+        .inner_margin(Margin::symmetric(16, 12))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.label(RichText::new(label.to_uppercase()).size(10.5).color(MUTED));
-            ui.label(RichText::new(value).size(22.0).color(color).strong());
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.label(RichText::new(label.to_uppercase()).font(sb(10.5)).color(MUTED).extra_letter_spacing(0.7));
+            ui.label(RichText::new(value).font(sb(23.0)).color(color));
         });
 }
 
@@ -346,12 +451,14 @@ impl eframe::App for App {
 
         // ---------- header ----------
         egui::Panel::top("header")
-            .frame(egui::Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(18, 12)).stroke(Stroke::new(1.0, BORDER)))
+            .frame(egui::Frame::new().fill(SURFACE).inner_margin(Margin::symmetric(20, 13)))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("MINERS HAVEN").size(20.0).strong().color(BLUE));
-                    ui.label(RichText::new("MINER").size(20.0).strong().color(TEXT));
-                    ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(12.0).color(MUTED));
+                    ui.spacing_mut().item_spacing.x = 7.0;
+                    ui.label(RichText::new("MINERS HAVEN").font(sb(18.0)).color(TEXT).extra_letter_spacing(0.6));
+                    ui.label(RichText::new("MINER").font(sb(18.0)).color(ACCENT).extra_letter_spacing(0.6));
+                    ui.add_space(4.0);
+                    ui.label(RichText::new(format!("v{}", env!("CARGO_PKG_VERSION"))).size(11.5).color(MUTED));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (txt, col) = match &self.engine {
                             None => ("Stopped".to_string(), MUTED),
@@ -361,16 +468,18 @@ impl eframe::App for App {
                                 (capitalize(&st), col)
                             }
                         };
-                        egui::Frame::new().fill(RAISED).corner_radius(CornerRadius::same(20)).inner_margin(Margin::symmetric(12, 5))
+                        egui::Frame::new().fill(INPUT).stroke(Stroke::new(1.0, BORDER)).corner_radius(CornerRadius::same(20))
+                            .inner_margin(Margin::symmetric(12, 5))
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
-                                    let (r, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                                    ui.painter().circle_filled(r.center(), 5.0, col);
-                                    ui.label(RichText::new(txt).color(col).strong());
+                                    let (r, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                                    ui.painter().circle_filled(r.center(), 4.0, col);
+                                    ui.label(RichText::new(txt).font(sb(12.5)).color(col));
                                 });
                             });
                         if hugepages::is_admin() {
-                            ui.label(RichText::new("Administrator").size(11.0).color(MUTED));
+                            ui.add_space(6.0);
+                            ui.label(RichText::new("Administrator").size(11.5).color(MUTED));
                         }
                     });
                 });
@@ -378,39 +487,46 @@ impl eframe::App for App {
 
         // ---------- settings ----------
         egui::Panel::left("settings")
-            .exact_size(330.0)
+            .exact_size(348.0)
             .resizable(false)
-            .frame(egui::Frame::new().fill(SURFACE).inner_margin(Margin::same(16)).stroke(Stroke::new(1.0, BORDER)))
+            .frame(egui::Frame::new().fill(SURFACE).inner_margin(Margin { left: 20, right: 12, top: 4, bottom: 14 }))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_enabled_ui(!running, |ui| self.settings_ui(ui));
-                    ui.add_space(14.0);
-
-                    let (label, fill) = if running { ("STOP MINING", RED) } else { ("START MINING", ACCENT_FILL) };
-                    let btn = egui::Button::new(RichText::new(label).size(16.0).strong().color(Color32::WHITE))
+                // the start button stays pinned to the bottom; the settings scroll above it
+                egui::Panel::bottom("start").frame(egui::Frame::new().inner_margin(Margin { left: 0, right: 8, top: 10, bottom: 0 })).show(ui, |ui| {
+                    let (label, fill, ink) = if running { ("STOP MINING", RED, Color32::WHITE) } else { ("START MINING", ACCENT, BG) };
+                    let btn = egui::Button::new(RichText::new(label).font(sb(14.5)).color(ink).extra_letter_spacing(0.8))
                         .fill(fill)
-                        .corner_radius(CornerRadius::same(10))
-                        ;
+                        .stroke(Stroke::NONE)
+                        .corner_radius(CornerRadius::same(10));
                     if ui.add_sized(egui::vec2(ui.available_width(), 46.0), btn).clicked() {
                         if running { self.stop() } else { self.start() }
                     }
                     if let Some(e) = &self.error {
                         ui.label(RichText::new(e).color(RED));
                     }
-                    ui.add_space(6.0);
                     let wallet = self.s.wallet().trim();
                     if !wallet.is_empty() && !self.s.other() {
                         let url = format!("{SITE}/#/miner/{}/{}", self.s.pool_id(), wallet);
-                        if ui.link(RichText::new("View my stats on theminershaven.org  ->").color(ACCENT)).clicked() {
-                            ctx.open_url(egui::OpenUrl::new_tab(url));
-                        }
+                        ui.vertical_centered(|ui| {
+                            if ui.link(RichText::new("View my stats on theminershaven.org").size(12.5).color(ACCENT)).clicked() {
+                                ctx.open_url(egui::OpenUrl::new_tab(url));
+                            }
+                        });
                     }
+                });
+                egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| {
+                    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                        // keep the content clear of the scroll bar
+                        ui.set_width(ui.available_width() - 10.0);
+                        ui.add_enabled_ui(!running, |ui| self.settings_ui(ui));
+                        ui.add_space(8.0);
+                    });
                 });
             });
 
         // ---------- dashboard ----------
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(16)))
+            .frame(egui::Frame::new().fill(BG).inner_margin(Margin::same(18)))
             .show(ui, |ui| self.dashboard_ui(ui));
     }
 
@@ -431,92 +547,23 @@ fn capitalize(s: &str) -> String {
 impl App {
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         section(ui, "Pool");
-        ui.horizontal(|ui| {
-            for (id, name) in [("mh", "Miners Haven"), ("other", "Other pool")] {
-                let sel = self.s.pool_mode == id;
-                let b = egui::Button::new(RichText::new(name).strong().color(if sel { Color32::WHITE } else { TEXT }))
-                    .fill(if sel { ACCENT_FILL } else { RAISED })
-                    .min_size(egui::vec2(140.0, 32.0));
-                if ui.add(b).clicked() {
-                    self.s.pool_mode = id.into();
-                }
-            }
-        });
-
-        section(ui, "Coin");
-        let cur = self.s.coin();
-        egui::ComboBox::from_id_salt("coin")
-            .selected_text(RichText::new(format!("{}  -  {}", cur.symbol, cur.name)).strong())
-            .width(ui.available_width())
-            .height(400.0)
-            .show_ui(ui, |ui| {
-                for c in engine::COINS {
-                    let tag = if c.algo.gpu() { "GPU" } else { "CPU" };
-                    let label = format!("{:<5} {}   ({}, {tag})", c.symbol, c.name, c.algo.name());
-                    if ui.selectable_label(self.s.coin == c.id, label).clicked() {
-                        self.s.coin = c.id.into();
-                    }
-                }
-            });
-        let c = self.s.coin();
-        ui.label(RichText::new(format!("{} - mined on your {}", c.algo.name(), if c.algo.gpu() { "graphics card" } else { "processor" }))
-            .size(11.0).color(MUTED));
+        segmented(ui, &mut self.s.pool_mode, &[("mh".to_string(), "Miners Haven".to_string(), true), ("other".to_string(), "Other pool".to_string(), true)], 30.0);
 
         if self.s.other() {
             self.other_pool_ui(ui);
         } else {
-            section(ui, "Location");
-            let c = self.s.coin();
-            let pings = self.pings.lock().unwrap().clone().filter(|p| p.0 == c.id);
-            let ms = |v: Option<u32>| v.map(|x| format!("{x} ms")).unwrap_or_else(|| if pings.is_some() { "offline".into() } else { "...".into() });
-            let (pe, pu) = pings.as_ref().map(|p| (p.1, p.2)).unwrap_or((None, None));
-            ui.horizontal(|ui| {
-                for (id, name, sub, enabled) in [
-                    ("auto", "Auto", "fastest".to_string(), true),
-                    ("us", "US", if c.us { ms(pu) } else { "n/a".into() }, c.us),
-                    ("eu", "EU", ms(pe), true),
-                ] {
-                    let sel = self.s.region == id || (id == "eu" && self.s.region == "us" && !c.us);
-                    let txt = RichText::new(format!("{name}\n{sub}")).size(12.5).color(if sel { Color32::WHITE } else { TEXT });
-                    let b = egui::Button::new(txt).fill(if sel { ACCENT_FILL } else { RAISED }).min_size(egui::vec2(92.0, 40.0));
-                    if ui.add_enabled(enabled, b).clicked() {
-                        self.s.region = id.into();
-                    }
-                }
-            });
-            let note = if !c.us {
-                format!("{} runs on the EU server only.", c.symbol)
-            } else {
-                match self.s.region.as_str() {
-                    "us" => "US - St. Louis, with EU as backup.".to_string(),
-                    "eu" => "EU - Germany, with US as backup.".to_string(),
-                    _ => "Picks the closer server, the other one is the backup.".to_string(),
-                }
-            };
-            ui.label(RichText::new(note).size(11.0).color(MUTED));
-
-            section(ui, "Payout");
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.s.solo, false, "PPLNS (steady payouts)");
-                ui.selectable_value(&mut self.s.solo, true, "SOLO");
-            });
+            self.our_pool_ui(ui);
         }
 
-        section(ui, &format!("{} wallet address", self.s.coin().symbol));
-        ui.add(egui::TextEdit::multiline(self.s.wallet_mut()).desired_rows(3).desired_width(f32::INFINITY)
-            .hint_text("Paste the address the pool should pay"));
-
-        section(ui, "Worker name");
-        ui.add(egui::TextEdit::singleline(&mut self.s.worker).desired_width(f32::INFINITY));
-
-        let algo = self.s.coin().algo;
+        let algo = self.s.algo();
         if !algo.gpu() {
             let min = if algo.gpu_capable() && !self.gpus.is_empty() { 0 } else { 1 };
             self.s.threads = self.s.threads.max(min);
             section(ui, &format!("CPU threads  ({} available)", self.cores));
+            ui.spacing_mut().slider_width = ui.available_width() - 56.0;
             ui.add(egui::Slider::new(&mut self.s.threads, min..=self.cores));
             if min == 0 {
-                ui.label(RichText::new("Your graphics card does most of the work; 0 leaves the processor free.").size(11.0).color(MUTED));
+                hint(ui, "Your graphics card does most of the work; 0 leaves the processor free.");
             }
         }
         if algo.gpu_capable() {
@@ -536,57 +583,108 @@ impl App {
             }
         }
 
-        ui.add_space(4.0);
+        ui.add_space(10.0);
         ui.checkbox(&mut self.s.start_on_open, "Start mining when the app opens");
-        ui.add_space(4.0);
-        egui::CollapsingHeader::new(RichText::new("Advanced").color(MUTED))
-            .default_open(!self.s.custom_pool.is_empty() || self.s.large || self.s.light)
-            .show(ui, |ui| {
-                if !self.s.other() {
-                    ui.checkbox(&mut self.s.large, "Large CPU / rental port (higher start difficulty)");
-                }
-                if self.s.coin().algo == engine::Algo::RandomX {
-                    ui.checkbox(&mut self.s.light, "Light mode: 256 MB RAM instead of 2 GB (much slower)");
-                }
-            });
+        let large = !self.s.other();
+        let light = algo == engine::Algo::RandomX;
+        if large || light {
+            egui::CollapsingHeader::new(RichText::new("Advanced").color(SOFT))
+                .default_open(self.s.large || self.s.light)
+                .show(ui, |ui| {
+                    if large {
+                        ui.checkbox(&mut self.s.large, "Large rig / rental port (higher start difficulty)");
+                    }
+                    if light {
+                        ui.checkbox(&mut self.s.light, "Light mode: 256 MB RAM instead of 2 GB (much slower)");
+                    }
+                });
+        }
     }
 
-    fn other_pool_ui(&mut self, ui: &mut egui::Ui) {
-        // well-known RandomX pools; the address box stays editable
-        const PRESETS: [(&str, &str, &str); 5] = [
-            ("SupportXMR", "xmr", "pool.supportxmr.com:3333"),
-            ("SupportXMR (SSL)", "xmr", "stratum+ssl://pool.supportxmr.com:443"),
-            ("MoneroOcean", "xmr", "gulf.moneroocean.stream:10128"),
-            ("HashVault (SSL)", "xmr", "stratum+ssl://pool.hashvault.pro:443"),
-            ("P2Pool on this PC", "xmr", "127.0.0.1:3333"),
-        ];
-        section(ui, "Pool address");
-        ui.label(egui::RichText::new(format!("Dev fee on other pools: {}% of mining time. No fee on Miners Haven pools.", mhminer::fee::FEE_PERCENT)).small().weak());
-        let current = PRESETS.iter().find(|p| p.2 == self.s.other_pool.trim()).map(|p| p.0).unwrap_or("Custom");
-        egui::ComboBox::from_id_salt("preset")
-            .selected_text(current)
+    /// Miners Haven: pick a coin and everything else is filled in.
+    fn our_pool_ui(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Coin");
+        let cur = self.s.coin();
+        egui::ComboBox::from_id_salt("coin")
+            .selected_text(RichText::new(format!("{}  -  {}", cur.symbol, cur.name)).font(sb(13.5)))
             .width(ui.available_width())
+            .height(400.0)
             .show_ui(ui, |ui| {
-                for (name, coin, url) in PRESETS {
-                    if ui.selectable_label(current == name, name).clicked() {
-                        self.s.other_pool = url.into();
-                        self.s.coin = coin.into();
+                for c in engine::COINS {
+                    let tag = if c.algo.gpu() { "GPU" } else if c.algo.gpu_capable() { "GPU + CPU" } else { "CPU" };
+                    let label = format!("{}  -  {}   ({}, {tag})", c.symbol, c.name, c.algo.name());
+                    if ui.selectable_label(self.s.coin == c.id, label).clicked() {
+                        self.s.coin = c.id.into();
                     }
                 }
-                if ui.selectable_label(current == "Custom", "Custom (type it below)").clicked() && current != "Custom" {
-                    self.s.other_pool.clear();
+            });
+        let c = self.s.coin();
+        let on = if c.algo.gpu() { "graphics card" } else if c.algo.gpu_capable() { "graphics card and processor" } else { "processor" };
+        hint(ui, &format!("{}, mined on your {on}", c.algo.name()));
+
+        section(ui, "Location");
+        let pings = self.pings.lock().unwrap().clone().filter(|p| p.0 == c.id);
+        let ms = |v: Option<u32>| v.map(|x| format!("{x} ms")).unwrap_or_else(|| if pings.is_some() { "offline".into() } else { "...".into() });
+        let (pe, pu) = pings.as_ref().map(|p| (p.1, p.2)).unwrap_or((None, None));
+        if self.s.region == "us" && !c.us {
+            self.s.region = "eu".into();
+        }
+        segmented(ui, &mut self.s.region, &[
+            ("auto".to_string(), "Auto\nfastest".to_string(), true),
+            ("us".to_string(), format!("US\n{}", if c.us { ms(pu) } else { "n/a".into() }), c.us),
+            ("eu".to_string(), format!("EU\n{}", ms(pe)), true),
+        ], 42.0);
+        let note = if !c.us {
+            format!("{} runs on the EU server only.", c.symbol)
+        } else {
+            match self.s.region.as_str() {
+                "us" => "US (St. Louis), with EU as backup.".to_string(),
+                "eu" => "EU (Germany), with US as backup.".to_string(),
+                _ => "Picks the closer server; the other one is the backup.".to_string(),
+            }
+        };
+        hint(ui, &note);
+
+        section(ui, "Payout");
+        segmented(ui, &mut self.s.solo, &[(false, "PPLNS".to_string(), true), (true, "SOLO".to_string(), true)], 30.0);
+        hint(ui, if self.s.solo { "You keep the whole block when you find one." } else { "Steady payouts, shared with the other miners." });
+
+        section(ui, &format!("{} wallet address", self.s.coin().symbol));
+        ui.add(egui::TextEdit::multiline(self.s.wallet_mut()).desired_rows(2).desired_width(f32::INFINITY).margin(Margin::symmetric(10, 8))
+            .hint_text(RichText::new("Paste the address the pool should pay").color(Color32::from_rgb(0x45, 0x53, 0x6c))));
+
+        section(ui, "Worker name");
+        input(ui, &mut self.s.worker, "rig1");
+    }
+
+    /// Any other pool: only what the pool asks for.
+    fn other_pool_ui(&mut self, ui: &mut egui::Ui) {
+        section(ui, "Algorithm");
+        let current = ALGOS.iter().find(|a| a.0 == self.s.other_algo).unwrap_or(&ALGOS[0]);
+        egui::ComboBox::from_id_salt("algo")
+            .selected_text(RichText::new(current.2).font(sb(13.5)))
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for (id, _, label) in ALGOS {
+                    if ui.selectable_label(self.s.other_algo == id, label).clicked() {
+                        self.s.other_algo = id.into();
+                    }
                 }
             });
-        ui.add(egui::TextEdit::singleline(&mut self.s.other_pool).desired_width(f32::INFINITY)
-            .hint_text("host:port   or   stratum+ssl://host:port"));
-        ui.label(RichText::new("Add backups with commas. Use stratum+ssl:// for SSL/TLS ports.").size(11.0).color(MUTED));
 
-        section(ui, "Username (optional)");
-        ui.add(egui::TextEdit::singleline(&mut self.s.other_user).desired_width(f32::INFINITY)
-            .hint_text("leave empty to use your wallet address"));
-        section(ui, "Password (optional)");
-        ui.add(egui::TextEdit::singleline(&mut self.s.other_pass).desired_width(f32::INFINITY)
-            .hint_text("leave empty to send the worker name"));
+        section(ui, "Pool address");
+        input(ui, &mut self.s.other_pool, "host:port");
+        hint(ui, "For SSL ports use stratum+ssl://host:port. Add backups with commas.");
+
+        section(ui, "Wallet address or username");
+        input(ui, &mut self.s.other_user, "as the pool asks for it, e.g. wallet.rig1");
+
+        section(ui, "Password");
+        input(ui, &mut self.s.other_pass, "x");
+
+        ui.add_space(4.0);
+        ui.label(RichText::new(format!("Dev fee on other pools: {}% of mining time. No fee on Miners Haven.", mhminer::fee::FEE_PERCENT))
+            .size(11.5).color(MUTED));
     }
 
     fn dashboard_ui(&mut self, ui: &mut egui::Ui) {
@@ -635,15 +733,15 @@ impl App {
             Some(e) => (e.stats.diff_text.lock().unwrap().clone(), e.stats.devices.lock().unwrap().clone()),
             None => (String::new(), vec![]),
         };
-        let gpu_coin = self.s.coin().algo.gpu() || (self.s.coin().algo.gpu_capable() && !devices.is_empty());
+        let gpu_coin = self.s.algo().gpu() || (self.s.algo().gpu_capable() && !devices.is_empty());
 
+        ui.spacing_mut().item_spacing = egui::vec2(10.0, 10.0);
         ui.columns(4, |c| {
             card(&mut c[0], "Hashrate", hr(rate), ACCENT);
             card(&mut c[1], "Accepted", acc.to_string(), GREEN);
             card(&mut c[2], "Rejected", rej.to_string(), if rej > 0 { RED } else { TEXT });
             card(&mut c[3], "Share diff", if diff_text.is_empty() { dash(diff) } else { diff_text.clone() }, TEXT);
         });
-        ui.add_space(4.0);
         ui.columns(4, |c| {
             card(&mut c[0], "Block height", dash(height), TEXT);
             card(&mut c[1], "Uptime", if self.running() { uptime(up) } else { "-".into() }, TEXT);
@@ -658,23 +756,27 @@ impl App {
             card(&mut c[3], "Pool", if conn { "Connected".into() } else if self.running() { "Connecting".into() } else { "-".into() },
                 if conn { GREEN } else { MUTED });
         });
-        if conn {
-            ui.label(RichText::new(pool).size(11.0).color(MUTED));
-        }
-        for d in &devices {
-            ui.label(RichText::new(d).monospace().size(12.0).color(TEXT));
+        if conn || !devices.is_empty() {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                if conn {
+                    ui.label(RichText::new(format!("Connected to {pool}")).size(11.5).color(MUTED));
+                }
+                for d in &devices {
+                    ui.label(RichText::new(d).monospace().size(12.0).color(SOFT));
+                }
+            });
         }
 
         // hashrate chart
-        ui.add_space(6.0);
         egui::Frame::new()
             .fill(SURFACE)
             .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(12))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.label(RichText::new("HASHRATE  (LAST 30 MIN)").size(10.5).color(MUTED));
+                ui.label(RichText::new("HASHRATE  (LAST 30 MIN)").font(sb(10.5)).color(MUTED).extra_letter_spacing(0.7));
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 120.0), egui::Sense::hover());
                 let p = ui.painter_at(rect);
                 for i in 1..4 {
@@ -712,22 +814,21 @@ impl App {
             });
 
         // log
-        ui.add_space(6.0);
         egui::Frame::new()
-            .fill(Color32::from_rgb(0x07, 0x0d, 0x1a))
+            .fill(INPUT)
             .stroke(Stroke::new(1.0, BORDER))
-            .corner_radius(CornerRadius::same(10))
-            .inner_margin(Margin::same(12))
+            .corner_radius(CornerRadius::same(12))
+            .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
                 ui.set_min_height(ui.available_height());
-                ui.label(RichText::new("LOG").size(10.5).color(MUTED));
+                ui.label(RichText::new("LOG").font(sb(10.5)).color(MUTED).extra_letter_spacing(0.7));
                 egui::ScrollArea::vertical().stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
                     let logs = self.logs.lock().unwrap();
                     for l in logs.iter() {
                         let col = if l.contains("accepted") { GREEN } else if l.contains("rejected") || l.contains("lost") || l.contains("could not") {
                             RED
-                        } else if l.contains("huge pages") || l.contains("DAG") || l.contains("epoch") { WARN } else { Color32::from_rgb(0xb8, 0xc2, 0xd6) };
+                        } else if l.contains("huge pages") || l.contains("DAG") || l.contains("epoch") { WARN } else { SOFT };
                         ui.label(RichText::new(l).monospace().size(12.0).color(col));
                     }
                 });
@@ -740,8 +841,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Miners Haven Miner")
-            .with_inner_size([1100.0, 720.0])
-            .with_min_inner_size([900.0, 600.0])
+            .with_inner_size([1120.0, 760.0])
+            .with_min_inner_size([940.0, 620.0])
             .with_icon(Arc::new(icon)),
         ..Default::default()
     };
