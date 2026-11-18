@@ -146,10 +146,9 @@ impl Context {
             let mut dev = 0;
             check("cuDeviceGet", (a.device_get)(&mut dev, index as c_int))?;
             let mut ctx = std::ptr::null_mut();
-            // By default the driver spins on a processor core while the card works. MH_CUDA_BLOCK=1
-            // asks it to sleep instead (4 = CU_CTX_SCHED_BLOCKING_SYNC): kinder to the processor,
-            // not yet shown to cost no speed.
-            let flags = if std::env::var("MH_CUDA_BLOCK").is_ok() { 4 } else { 0 };
+            // 4 = CU_CTX_SCHED_BLOCKING_SYNC: sleep while the card works instead of spinning on a
+            // processor core. Measured on Pearl: no speed lost. MH_CUDA_SPIN=1 restores spinning.
+            let flags = if std::env::var("MH_CUDA_SPIN").is_ok() { 0 } else { 4 };
             check("cuCtxCreate", (a.ctx_create)(&mut ctx, flags, dev))?;
             Ok(Context { ctx })
         }
