@@ -2073,6 +2073,7 @@ version = "2.5.0"
 dependencies = [
  "base64 0.21.7",
  "bincode",
+ "blake3",
  "chrono",
  "clap 4.6.8",
  "eframe",

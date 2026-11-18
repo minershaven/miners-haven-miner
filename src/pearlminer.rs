@@ -353,6 +353,8 @@ pub fn bench_gpu(index: usize, secs: u64, log: &Log) -> Result<f64, String> {
         let _ = h.join();
     }
     let n = rounds.max(1) as f64;
+    let (threads, regs) = gpu.shape();
+    log(&format!("kernel: {threads} threads per block, {regs} registers each"));
     log(&format!("{rounds} rounds, {:.1} ms each: waiting for the processor {:.1}, loading A {:.1}, multiplying {:.1}  (card alone {})", total * 1e3 / n, waited * 1e3 / n, gpu.load_time * 1e3 / n, gpu.kernel_time * 1e3 / n, crate::engine::hr(n * work as f64 / gpu.kernel_time)));
     Ok(rounds as f64 * work as f64 / total)
 }
@@ -518,11 +520,16 @@ fn gpu_mine(dev: crate::cuda::Device, slot: usize, sh: Arc<Shared>, log: Log) {
                     log(&format!("{name}: result failed the CPU check ({bad} so far) - lower the GPU overclock if this repeats"));
                     continue;
                 }
-                let Some(proof) = pearl::encode(&job.proof(round.counter, ri, ci)) else { continue };
-                let body = json!({"job_id": cur.id, "plain_proof": proof}).to_string();
-                if let Some(out) = sh.out.lock().unwrap().as_ref() {
-                    let _ = out.send(body);
-                }
+                // building the proof hashes both matrices again: do it off this thread so the
+                // card keeps working
+                let (job, sh, id, counter) = (job.clone(), sh.clone(), cur.id.clone(), round.counter);
+                std::thread::spawn(move || {
+                    let Some(proof) = pearl::encode(&job.proof(counter, ri, ci)) else { return };
+                    let body = json!({"job_id": id, "plain_proof": proof}).to_string();
+                    if let Some(out) = sh.out.lock().unwrap().as_ref() {
+                        let _ = out.send(body);
+                    }
+                });
             }
         }
         drop(rx);

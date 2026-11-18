@@ -25,6 +25,7 @@ struct Api {
     ctx_sync: unsafe extern "C" fn() -> Res,
     module_load: unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> Res,
     module_fn: unsafe extern "C" fn(*mut *mut c_void, *mut c_void, *const c_char) -> Res,
+    func_attr: unsafe extern "C" fn(*mut c_int, c_int, *mut c_void) -> Res,
     mem_alloc: unsafe extern "C" fn(*mut u64, usize) -> Res,
     mem_free: unsafe extern "C" fn(u64) -> Res,
     h2d: unsafe extern "C" fn(u64, *const c_void, usize) -> Res,
@@ -59,6 +60,7 @@ fn api() -> Option<&'static Api> {
             ctx_sync: sym!(b"cuCtxSynchronize\0"),
             module_load: sym!(b"cuModuleLoadData\0"),
             module_fn: sym!(b"cuModuleGetFunction\0"),
+            func_attr: sym!(b"cuFuncGetAttribute\0"),
             mem_alloc: sym!(b"cuMemAlloc_v2\0"),
             mem_free: sym!(b"cuMemFree_v2\0"),
             h2d: sym!(b"cuMemcpyHtoD_v2\0"),
@@ -171,6 +173,13 @@ impl Context {
         let mut f = std::ptr::null_mut();
         check(&format!("finding kernel {name}"), unsafe { (api().unwrap().module_fn)(&mut f, module.0, n.as_ptr()) })?;
         Ok(Function(f))
+    }
+
+    /// Registers the driver gave each thread of a kernel (what limits how many run at once).
+    pub fn registers(&self, f: Function) -> u32 {
+        let mut n = 0;
+        unsafe { (api().unwrap().func_attr)(&mut n, 4, f.0) };
+        n as u32
     }
 
     pub fn alloc(&self, len: usize) -> Result<Buffer, String> {

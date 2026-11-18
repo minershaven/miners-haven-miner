@@ -13,7 +13,7 @@ use primitive_types::U256;
 use zk_pow::api::proof::{IncompleteBlockHeader, MMAType, MiningConfiguration, PeriodicPattern, SeedDerivation};
 use zk_pow::api::proof_utils::compute_jackpot_hash;
 use zk_pow::api::sanity_checks::penalized_target_bound;
-use zk_pow::circuit::pearl_noise::compute_noise_for_indices;
+use zk_pow::circuit::pearl_noise::{compute_noise_for_indices, generate_permutation_matrix, generate_uniform_random_matrix};
 use zk_pow::circuit::pearl_program::{JACKPOT_SIZE, LROT_PER_TILE};
 use zk_pow::ffi::plain_proof::{MatrixMerkleProof, PlainProof, list_to_pattern};
 
@@ -230,8 +230,28 @@ pub struct GpuRound {
     /// which keying of A this is
     pub counter: u64,
     pub a_noise_seed: [u8; 32],
-    /// A with noise (m x k)
-    pub an: Vec<i8>,
+    /// the cells of A the counter is written into (row 0, columns 0..8)
+    pub cells: [i8; 8],
+    /// A's noise in the two factors the protocol builds it from; the card applies them:
+    /// noise[r][c] = eal[r][perm[c][0]] - eal[r][perm[c][1]]. eal is m x RANK, row-major.
+    pub eal: Vec<i8>,
+    pub perm: Vec<[u32; 2]>,
+}
+
+/// The protocol's seed label for A's noise ("A_tensor", zero-padded).
+const SEED_LABEL_A: [u8; 32] = {
+    let mut l = [0u8; 32];
+    let s = *b"A_tensor";
+    let mut i = 0;
+    while i < 8 {
+        l[i] = s[i];
+        i += 1;
+    }
+    l
+};
+
+fn key_cells(counter: u64) -> [i8; 8] {
+    std::array::from_fn(|i| ((counter >> (6 * i)) & 63) as i8 - 32)
 }
 
 fn as_u8(v: &[i8]) -> &[u8] {
@@ -273,22 +293,51 @@ impl GpuJob {
     /// A as keying `counter` commits to it: the counter is written into its first cells.
     fn keyed_a(&self, counter: u64) -> Vec<i8> {
         let mut a = self.a.clone();
-        for (i, cell) in a.iter_mut().take(8).enumerate() {
-            *cell = ((counter >> (6 * i)) & 63) as i8 - 32;
-        }
+        a[..8].copy_from_slice(&key_cells(counter));
         a
     }
 
-    /// Keying `counter` of A, with its noise. Safe to prepare on another thread while the
-    /// card works on the previous one.
+    /// A before keying and noise (m x k, row-major), as the card keeps it for a whole block.
+    pub fn a(&self) -> &[i8] {
+        &self.a
+    }
+
+    /// One row of A as keying `round` multiplies it: counter cells written, noise added.
+    /// (A's cells stay within [-64, 64] and the noise within [-63, 63], so it fits int8.)
+    pub fn an_row(&self, round: &GpuRound, r: usize) -> Vec<i8> {
+        let mut row = self.a[r * self.k..(r + 1) * self.k].to_vec();
+        if r == 0 {
+            row[..8].copy_from_slice(&round.cells);
+        }
+        let e = &round.eal[r * RANK..(r + 1) * RANK];
+        for (x, p) in row.iter_mut().zip(&round.perm) {
+            *x = (*x as i32 + e[p[0] as usize] as i32 - e[p[1] as usize] as i32) as i8;
+        }
+        row
+    }
+
+    /// Keying `counter` of A: its commitment, noise seed and the factors of its noise. The card
+    /// adds the noise itself, so all the processor does is hash A once and derive the factors.
+    /// Safe to prepare on another thread while the card works on the previous keying.
     pub fn round(&self, counter: u64) -> Option<GpuRound> {
-        let a = self.keyed_a(counter);
-        let raw_a = blake3_digest(&pad_to_chunk_boundary(as_u8(&a)), Some(self.job_key));
+        let cells = key_cells(counter);
+        let bytes = as_u8(&self.a);
+        let raw_a = if bytes.len() % 1024 == 0 && bytes.len() >= 8 {
+            // the commitment is a keyed BLAKE3 of A (already a whole number of chunks): hash
+            // the counter cells and then the rest in place, without copying A
+            let mut h = blake3::Hasher::new_keyed(&self.job_key);
+            h.update(as_u8(&cells));
+            h.update_rayon(&bytes[8..]);
+            *h.finalize().as_bytes()
+        } else {
+            blake3_digest(&pad_to_chunk_boundary(as_u8(&self.keyed_a(counter))), Some(self.job_key))
+        };
         let hash_a = self.seeds.bind_roots(&raw_a, &[0; 32], self.m as u32, self.n as u32).0;
         let a_noise_seed = blake3_digest(&[&self.b_noise_seed[..], &hash_a[..]].concat(), None);
         let rows: Vec<usize> = (0..self.m).collect();
-        let noise = compute_noise_for_indices(self.k, RANK, (self.b_noise_seed, a_noise_seed), &rows, &[]);
-        Some(GpuRound { counter, a_noise_seed, an: add_noise(&a, &noise.a, self.k)? })
+        let eal = generate_uniform_random_matrix(&SEED_LABEL_A, &a_noise_seed, &rows, RANK).concat();
+        let perm = generate_permutation_matrix(&SEED_LABEL_A, &a_noise_seed, self.k, RANK);
+        Some(GpuRound { counter, a_noise_seed, cells, eal, perm })
     }
 
     /// Rows of A in row tile `ri` and columns of B in column tile `ci`.
@@ -302,13 +351,14 @@ impl GpuJob {
     pub fn jackpot(&self, round: &GpuRound, ri: usize, ci: usize) -> ([u32; JACKPOT_SIZE], [u8; 32]) {
         let k = self.k;
         let (rows, cols) = self.tile(ri, ci);
+        let an: Vec<Vec<i8>> = rows.iter().map(|&r| self.an_row(round, r)).collect();
         let mut acc = vec![0i32; rows.len() * cols.len()];
         let mut jackpot = [0u32; JACKPOT_SIZE];
         for c in 0..k / RANK {
             let (lo, hi) = (c * RANK, (c + 1) * RANK);
             let mut x = 0u32;
-            for (u, &ar) in rows.iter().enumerate() {
-                let av = &round.an[ar * k + lo..ar * k + hi];
+            for (u, arow) in an.iter().enumerate() {
+                let av = &arow[lo..hi];
                 for (v, &bc) in cols.iter().enumerate() {
                     let bv = &self.btn[bc * k + lo..bc * k + hi];
                     let d: i32 = av.iter().zip(bv).map(|(&p, &q)| p as i32 * q as i32).sum();
@@ -416,4 +466,22 @@ mod tests {
         assert!(share_bound(&t, &cfg).unwrap() > U256::from_big_endian(&hex::decode(&t).unwrap()));
         assert_eq!(hashes_per_tile(&cfg), 2 * 64 * 4096);
     }
+    #[test]
+    fn card_noise_factors_match_the_protocol() {
+        // the rows the card builds from the factors must be exactly signal + protocol noise
+        let h = Header { version: 0x2040_0000, prev_block: [7; 32], merkle_root: [9; 32], timestamp: 1_800_000_000, nbits: 0x207f_ffff };
+        let job = GpuJob::new(&h, config(4096), 32, 256, SeedDerivation::Salted, 42).expect("noise fits int8");
+        let round = job.round(0x1234_5678_9abc).expect("round");
+        let a = job.keyed_a(round.counter);
+        let raw_a = blake3_digest(&pad_to_chunk_boundary(as_u8(&a)), Some(job.job_key));
+        let hash_a = job.seeds.bind_roots(&raw_a, &[0; 32], job.m as u32, job.n as u32).0;
+        assert_eq!(round.a_noise_seed, blake3_digest(&[&job.b_noise_seed[..], &hash_a[..]].concat(), None));
+        let rows: Vec<usize> = (0..job.m).collect();
+        let noise = compute_noise_for_indices(job.k, RANK, (job.b_noise_seed, round.a_noise_seed), &rows, &[]);
+        let want = add_noise(&a, &noise.a, job.k).expect("fits int8");
+        for r in 0..job.m {
+            assert_eq!(job.an_row(&round, r), want[r * job.k..(r + 1) * job.k], "row {r}");
+        }
+    }
+
 }

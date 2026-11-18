@@ -18,6 +18,8 @@ pub struct PearlGpu {
     a_raw: Option<Buffer>,
     b_raw: Option<Buffer>,
     an: Option<Buffer>,
+    eal: Option<Buffer>,
+    perm: Option<Buffer>,
     bn: Option<Buffer>,
     key: Buffer,
     bound: Buffer,
@@ -56,7 +58,7 @@ impl PearlGpu {
         let (key, bound, hits) = (ctx.alloc(32)?, ctx.alloc(32)?, ctx.alloc(4 * (MAX_HITS + 1))?);
         // the module must outlive the functions; it lives as long as the context
         std::mem::forget(module);
-        let mut gpu = PearlGpu { ctx, scan, debug, pack_a, pack_b, a_raw: None, b_raw: None, an: None, bn: None, key, bound, hits, threads, rows, load_time: 0.0, kernel_time: 0.0 };
+        let mut gpu = PearlGpu { ctx, scan, debug, pack_a, pack_b, a_raw: None, b_raw: None, an: None, eal: None, perm: None, bn: None, key, bound, hits, threads, rows, load_time: 0.0, kernel_time: 0.0 };
         if std::env::var("MH_PEARL_NOCHECK").is_err() {
             gpu.self_check()?;
         }
@@ -70,7 +72,7 @@ impl PearlGpu {
         let job = GpuJob::new(&header, cfg, self.rows, 256, SeedDerivation::Salted, 0xabcdef).ok_or("noise out of range")?;
         let round = job.round(1).ok_or("noise out of range")?;
         self.set_b(&job)?;
-        self.set_a(&round, job.k)?;
+        self.set_a(&round, &job)?;
         let tiles = self.rows / 16 * 32;
         let out = self.ctx.alloc(tiles * 24 * 4)?;
         self.ctx.zero(&out)?;
@@ -123,9 +125,23 @@ impl PearlGpu {
         ctx.launch(pack, (count.div_ceil(256), 1), 256, &mut [Arg::Ptr(raw.as_ref().unwrap().ptr), Arg::Ptr(packed.as_ref().unwrap().ptr), Arg::U32(k as u32), Arg::U32(blocks as u32), Arg::U32(count)])
     }
 
-    /// Upload B (once per block header).
+    /// Upload B with its noise and A as committed (once per block header).
     pub fn set_b(&mut self, job: &GpuJob) -> Result<(), String> {
-        Self::load(&self.ctx, self.pack_b, &mut self.b_raw, &mut self.bn, &job.btn, job.k, 8, job.n / 256)
+        Self::load(&self.ctx, self.pack_b, &mut self.b_raw, &mut self.bn, &job.btn, job.k, 16, job.n / 256)?;
+        let a = job.a();
+        if self.a_raw.as_ref().map(|b| b.len) != Some(a.len()) {
+            (self.a_raw, self.an, self.eal, self.perm) = (None, None, None, None);
+            self.a_raw = Some(self.ctx.alloc(a.len())?);
+            self.an = Some(self.ctx.alloc(a.len())?);
+            self.eal = Some(self.ctx.alloc(job.m * pearl::RANK)?);
+            self.perm = Some(self.ctx.alloc(job.k * 8)?);
+        }
+        self.ctx.upload(self.a_raw.as_ref().unwrap(), a)
+    }
+
+    /// For tuning: (threads per block, registers per thread) of the scan kernel.
+    pub fn shape(&self) -> (u32, u32) {
+        (self.threads, self.ctx.registers(self.scan))
     }
 
     fn threads(&self) -> u32 {
@@ -137,15 +153,23 @@ impl PearlGpu {
         self.rows
     }
 
-    fn set_a(&mut self, round: &GpuRound, k: usize) -> Result<(), String> {
-        Self::load(&self.ctx, self.pack_a, &mut self.a_raw, &mut self.an, &round.an, k, 16, round.an.len() / k / self.rows)?;
+    /// Key and noise A for one round on the card: only the noise factors are uploaded.
+    fn set_a(&mut self, round: &GpuRound, job: &GpuJob) -> Result<(), String> {
+        let (Some(raw), Some(an), Some(eal), Some(perm)) = (&self.a_raw, &self.an, &self.eal, &self.perm) else {
+            return Err("matrices for the block were not loaded".into());
+        };
+        self.ctx.upload(eal, &round.eal)?;
+        self.ctx.upload(perm, &round.perm.concat())?;
+        let c: Vec<u32> = round.cells.chunks(4).map(|w| u32::from_le_bytes([w[0] as u8, w[1] as u8, w[2] as u8, w[3] as u8])).collect();
+        let count = (job.m * job.k / 16) as u32;
+        self.ctx.launch(self.pack_a, (count.div_ceil(256), 1), 256, &mut [Arg::Ptr(raw.ptr), Arg::Ptr(an.ptr), Arg::U32(job.k as u32), Arg::U32((job.m / self.rows) as u32), Arg::U32(count), Arg::Ptr(eal.ptr), Arg::Ptr(perm.ptr), Arg::U32(c[0]), Arg::U32(c[1])])?;
         self.ctx.upload(&self.key, &words(&round.a_noise_seed))
     }
 
     /// Multiply and hash every tile; returns the (row tile, column tile) pairs under `bound`.
     pub fn scan(&mut self, job: &GpuJob, round: &GpuRound, bound: &U256) -> Result<Vec<(usize, usize)>, String> {
         let t = std::time::Instant::now();
-        self.set_a(round, job.k)?;
+        self.set_a(round, job)?;
         self.load_time += t.elapsed().as_secs_f64();
         let t = std::time::Instant::now();
         let mut le = [0u8; 32];
