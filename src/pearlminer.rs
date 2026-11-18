@@ -1,0 +1,299 @@
+//! Pearl (PRL) backend: the Pearl pool protocol and the mining loop (processor only for now).
+//!
+//! Protocol (JSON lines, named parameters): `mining.authorize {wallet, worker, pass, agent}`,
+//! then the pool pushes `mining.notify {header, height, job_id, target}` and takes
+//! `mining.submit {job_id, plain_proof}`. There is no subscribe step and no nonce: the proof
+//! carries its own randomness.
+
+use crate::engine::{Backend, Config, Log, Stats, spawn_meter};
+use crate::pearl::{self, Round};
+use crate::stratum::{Event, open, parse_pool};
+use primitive_types::U256;
+use serde_json::{Value, json};
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+use zk_pow::api::proof::SeedDerivation;
+
+const AGENT: &str = concat!("MinersHavenMiner/", env!("CARGO_PKG_VERSION"));
+/// Matrix sizes for a processor round: big enough that setting a round up is a small part of it.
+const M: usize = 1024;
+const N: usize = 1024;
+const K: usize = 4096;
+
+struct Job {
+    id: String,
+    header: pearl::Header,
+    bound: U256,
+}
+
+struct Shared {
+    job: RwLock<Option<Arc<Job>>>,
+    job_gen: AtomicU64,
+    stop: Arc<AtomicBool>,
+    hashes: AtomicU64,
+    /// lines waiting to go to the pool
+    out: Mutex<Option<mpsc::Sender<String>>>,
+}
+
+pub struct PearlMiner {
+    shared: Arc<Shared>,
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl Backend for PearlMiner {
+    fn stop(&mut self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+fn salt() -> u64 {
+    let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let mut x = t.as_nanos() as u64 ^ (std::process::id() as u64) << 32;
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^ (x >> 33)
+}
+
+/// Share difficulty a target stands for (the Bitcoin convention pools quote).
+fn difficulty_of(target_hex: &str) -> f64 {
+    let Ok(b) = hex::decode(target_hex.trim()) else { return 0.0 };
+    let t = b.iter().fold(0f64, |a, &x| a * 256.0 + x as f64);
+    if t > 0.0 { 65535.0 * 2f64.powi(208) / t } else { 0.0 }
+}
+
+pub fn start(cfg: &Config, route: Arc<crate::fee::Route>, stats: Arc<Stats>, log: Log) -> Box<dyn Backend> {
+    let threads = cfg.threads.max(1);
+    log(&format!("CPU: {threads} threads  (Pearl on the graphics card is not built yet, so this is slow)"));
+    let shared = Arc::new(Shared {
+        job: RwLock::new(None),
+        job_gen: AtomicU64::new(0),
+        stop: Arc::new(AtomicBool::new(false)),
+        hashes: AtomicU64::new(0),
+        out: Mutex::new(None),
+    });
+    let mut handles = Vec::new();
+    {
+        let (sh, st, lg) = (shared.clone(), stats.clone(), log.clone());
+        handles.push(std::thread::spawn(move || connection(route, sh, st, lg)));
+    }
+    {
+        let (sh, lg) = (shared.clone(), log.clone());
+        handles.push(std::thread::spawn(move || mine(threads, sh, lg)));
+    }
+    {
+        let sh = shared.clone();
+        handles.push(spawn_meter(stats, shared.stop.clone(), Arc::new(move || sh.hashes.load(Ordering::Relaxed))));
+    }
+    Box::new(PearlMiner { shared, handles })
+}
+
+/// Connect, authorize and exchange messages, reconnecting (with failover) on errors.
+fn connection(route: Arc<crate::fee::Route>, sh: Arc<Shared>, stats: Arc<Stats>, log: Log) {
+    let mut idx = 0usize;
+    while !sh.stop.load(Ordering::SeqCst) {
+        let (generation, dest) = route.current();
+        let pool = &dest.pools[idx % dest.pools.len()];
+        let r = session(pool, &dest.login, &dest.pass, &route, generation, &sh, &stats, &log);
+        *sh.out.lock().unwrap() = None;
+        if let Err(e) = r {
+            stats.pool_event(Event::Disconnected(format!("{pool}: {e}")), &log);
+        }
+        if route.generation() != generation {
+            idx = 0;
+            continue;
+        }
+        idx += 1;
+        for _ in 0..50 {
+            if sh.stop.load(Ordering::SeqCst) || route.generation() != generation {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn session(pool_s: &str, login: &str, pass: &str, route: &crate::fee::Route, generation: u64, sh: &Shared, stats: &Stats, log: &Log) -> Result<(), String> {
+    let pool = parse_pool(pool_s)?;
+    let mut stream = open(&pool)?;
+    let (wallet, worker) = login.split_once('.').unwrap_or((login, ""));
+    let mut auth = json!({"wallet": wallet, "pass": pass, "agent": AGENT});
+    if !worker.is_empty() {
+        auth["worker"] = json!(worker);
+    }
+    let send = |stream: &mut dyn Write, v: Value| -> Result<(), String> {
+        stream.write_all(format!("{v}\n").as_bytes()).map_err(|e| e.to_string())?;
+        stream.flush().map_err(|e| e.to_string())
+    };
+    send(&mut stream, json!({"id": 1, "method": "mining.authorize", "params": auth}))?;
+
+    let (out_tx, out_rx) = mpsc::channel::<String>();
+    *sh.out.lock().unwrap() = Some(out_tx);
+    let (mut buf, mut chunk) = (Vec::<u8>::new(), vec![0u8; 65536]);
+    let (started, mut last_rx, mut authorized) = (Instant::now(), Instant::now(), false);
+    let mut next_id = 10u64;
+    loop {
+        if sh.stop.load(Ordering::SeqCst) || route.generation() != generation {
+            return Ok(());
+        }
+        while let Ok(body) = out_rx.try_recv() {
+            // `body` is the submit's params object, already serialized
+            let line = format!("{{\"id\":{next_id},\"method\":\"mining.submit\",\"params\":{body}}}\n");
+            next_id += 1;
+            stream.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
+            stream.flush().map_err(|e| e.to_string())?;
+        }
+        if last_rx.elapsed() > Duration::from_secs(600) {
+            return Err("no data from the pool for 10 minutes".into());
+        }
+        if !authorized && started.elapsed() > Duration::from_secs(30) {
+            return Err("no reply to the login".into());
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => return Err("pool closed the connection".into()),
+            Ok(n) => {
+                last_rx = Instant::now();
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 1 << 22 {
+                    return Err("pool sent an oversized message".into());
+                }
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = buf.drain(..=pos).collect();
+            let Ok(v) = serde_json::from_slice::<Value>(&line) else { continue };
+            if v["method"] == "mining.notify" {
+                let p = &v["params"];
+                let (Some(header), Some(id), Some(target)) = (p["header"].as_str(), p["job_id"].as_str(), p["target"].as_str()) else {
+                    log("unusable job: missing header, job_id or target");
+                    continue;
+                };
+                let cfg = pearl::config(K);
+                let (Some(header), Some(bound)) = (pearl::parse_header(header), pearl::share_bound(target, &cfg)) else {
+                    log("unusable job: bad header or target");
+                    continue;
+                };
+                let d = difficulty_of(target);
+                let dt = if d >= 1000.0 { format!("{}", d.round() as u64) } else { format!("{d:.3}") };
+                stats.height.store(p["height"].as_u64().unwrap_or(0), Ordering::Relaxed);
+                stats.difficulty.store(d.round() as u64, Ordering::Relaxed);
+                if *stats.diff_text.lock().unwrap() != dt {
+                    log(&format!("new job  height {}  diff {dt}", p["height"].as_u64().unwrap_or(0)));
+                }
+                *stats.diff_text.lock().unwrap() = dt;
+                stats.set_status("mining");
+                *sh.job.write().unwrap() = Some(Arc::new(Job { id: id.to_string(), header, bound }));
+                sh.job_gen.fetch_add(1, Ordering::SeqCst);
+                continue;
+            }
+            let id = v["id"].as_u64().unwrap_or(0);
+            let err = v.get("error").filter(|e| !e.is_null()).map(|e| {
+                e["msg"].as_str().or(e["message"].as_str()).map(String::from).unwrap_or_else(|| e.to_string())
+            });
+            if id == 1 {
+                if let Some(e) = err {
+                    return Err(format!("login refused: {e}"));
+                }
+                if v["result"] == Value::Bool(false) {
+                    return Err("login refused (check the wallet address)".into());
+                }
+                authorized = true;
+                let tls = if pool.tls { " (TLS)" } else { "" };
+                stats.pool_event(Event::Connected(format!("{pool_s}{tls}")), log);
+            } else if id >= 10 {
+                match err {
+                    None => stats.pool_event(Event::Accepted, log),
+                    Some(e) => stats.pool_event(Event::Rejected(e), log),
+                }
+            }
+        }
+    }
+}
+
+/// Round after round: commit to fresh matrices, then scan their tiles on every thread.
+fn mine(threads: usize, sh: Arc<Shared>, log: Log) {
+    let cfg = pearl::config(K);
+    let per_scan = pearl::hashes_per_tile(&cfg);
+    let mut rounds = 0u64;
+    while !sh.stop.load(Ordering::SeqCst) {
+        let seen = sh.job_gen.load(Ordering::SeqCst);
+        let Some(job) = sh.job.read().unwrap().clone() else {
+            std::thread::sleep(Duration::from_millis(200));
+            continue;
+        };
+        rounds += 1;
+        // the current network rules (certificate version 3) use the salted seed derivation
+        let round = Round::new(&job.header, cfg, M, N, SeedDerivation::Salted, salt() ^ rounds.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+        let next = AtomicUsize::new(0);
+        let work = per_scan * round.col_tiles() as u64;
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                s.spawn(|| {
+                    loop {
+                        if sh.stop.load(Ordering::Relaxed) || sh.job_gen.load(Ordering::Relaxed) != seen {
+                            break;
+                        }
+                        let ri = next.fetch_add(1, Ordering::Relaxed);
+                        if ri >= round.row_tiles() {
+                            break;
+                        }
+                        let hits = round.scan(ri, &job.bound);
+                        sh.hashes.fetch_add(work, Ordering::Relaxed);
+                        for ci in hits {
+                            // a share for the old job would be stale by now
+                            if sh.job_gen.load(Ordering::Relaxed) != seen {
+                                break;
+                            }
+                            let Some(proof) = pearl::encode(&round.proof(ri, ci)) else {
+                                log("could not serialize a Pearl proof");
+                                continue;
+                            };
+                            let body = json!({"job_id": job.id, "plain_proof": proof}).to_string();
+                            if let Some(tx) = sh.out.lock().unwrap().as_ref() {
+                                let _ = tx.send(body);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// Hashrate of the processor path over `secs` seconds, without a pool.
+pub fn bench(threads: usize, secs: u64) -> f64 {
+    let cfg = pearl::config(K);
+    let header = pearl::Header { version: 0x2040_0000, prev_block: [1; 32], merkle_root: [2; 32], timestamp: 1_800_000_000, nbits: 0x1b01_4f8a };
+    let per_scan = pearl::hashes_per_tile(&cfg);
+    let (t0, mut total, mut seed) = (Instant::now(), 0u64, 1u64);
+    while t0.elapsed() < Duration::from_secs(secs) {
+        seed += 1;
+        let round = Round::new(&header, cfg, M, N, SeedDerivation::Salted, seed);
+        let next = AtomicUsize::new(0);
+        let done = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..threads.max(1) {
+                s.spawn(|| {
+                    loop {
+                        let ri = next.fetch_add(1, Ordering::Relaxed);
+                        if ri >= round.row_tiles() || t0.elapsed() >= Duration::from_secs(secs) {
+                            break;
+                        }
+                        let _ = round.scan(ri, &U256::zero());
+                        done.fetch_add(per_scan * round.col_tiles() as u64, Ordering::Relaxed);
+                    }
+                });
+            }
+        });
+        total += done.load(Ordering::Relaxed);
+    }
+    total as f64 / t0.elapsed().as_secs_f64()
+}

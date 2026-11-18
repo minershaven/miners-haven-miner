@@ -110,6 +110,10 @@ fn main() {
                 let rate = if args.threads == Some(0) { 0.0 } else { qtcminer::bench(threads.max(1), secs) };
                 println!(" benchmark QPoW: CPU {} with {threads} threads, GPU {}", hr(rate), hr(g));
             }
+            engine::Algo::Pearl => {
+                let rate = mhminer::pearlminer::bench(threads.max(1), secs);
+                println!(" benchmark pearlhash: CPU {} with {threads} threads", hr(rate));
+            }
             a => {
                 for g in gpu::list_gpus() {
                     println!(" GPU{}  {}  {:.1} GB", g.index, g.name, g.memory as f64 / 1073741824.0);

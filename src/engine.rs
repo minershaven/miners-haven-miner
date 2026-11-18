@@ -20,6 +20,8 @@ pub enum Algo {
     KawPow,
     FiroPow,
     ProgPowZ,
+    /// Pearl proof of useful work (matrix multiplication)
+    Pearl,
 }
 
 impl Algo {
@@ -30,6 +32,7 @@ impl Algo {
             Algo::KawPow => "KawPoW",
             Algo::FiroPow => "FiroPoW",
             Algo::ProgPowZ => "ProgPowZ",
+            Algo::Pearl => "pearlhash",
         }
     }
     /// GPU only (no CPU mining)
@@ -63,6 +66,7 @@ pub const COINS: &[Coin] = &[
     Coin { id: "abrs", symbol: "ABRS", name: "Aurora Borealis", algo: Algo::KawPow, port: 3161, us: true },
     Coin { id: "firo", symbol: "FIRO", name: "Firo", algo: Algo::FiroPow, port: 3121, us: true },
     Coin { id: "zano", symbol: "ZANO", name: "Zano", algo: Algo::ProgPowZ, port: 3061, us: true },
+    Coin { id: "prl", symbol: "PRL", name: "Pearl", algo: Algo::Pearl, port: 3001, us: true },
 ];
 
 pub fn coin(id: &str) -> Option<&'static Coin> {
@@ -315,6 +319,7 @@ impl Engine {
             Algo::RandomX => crate::rxminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
             Algo::QPow => crate::qtcminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
             Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ => crate::gpu::start(&cfg, route.clone(), stats.clone(), log.clone()),
+            Algo::Pearl => crate::pearlminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
         };
         // a speed line in the log once a minute
         let report = Arc::new(AtomicBool::new(false));
