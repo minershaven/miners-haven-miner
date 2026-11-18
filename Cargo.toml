@@ -32,3 +32,7 @@ path = "src/main.rs"
 [[bin]]
 name = "MinersHavenMiner"
 path = "src/gui.rs"
+
+[features]
+# test builds only: lets MH_FEE_TEST shorten the dev fee schedule
+feetest = []

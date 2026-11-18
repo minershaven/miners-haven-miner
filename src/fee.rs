@@ -141,7 +141,7 @@ pub fn spawn(route: Arc<Route>, stats: Arc<Stats>, stop: Arc<AtomicBool>, log: L
             }
             true
         };
-        // debug builds can shorten the schedule for testing: MH_FEE_TEST="first,fee,cycle" in seconds
+        // debug and `feetest` builds can shorten the schedule for testing: MH_FEE_TEST="first,fee,cycle" in seconds
         let (first, fee_secs, cycle) = test_schedule().unwrap_or((FIRST_AFTER_SECS, FEE_SECS, CYCLE_SECS));
         let mut pause = first;
         loop {
@@ -166,7 +166,7 @@ pub fn spawn(route: Arc<Route>, stats: Arc<Stats>, stop: Arc<AtomicBool>, log: L
 }
 
 fn test_schedule() -> Option<(u64, u64, u64)> {
-    if !cfg!(debug_assertions) {
+    if !cfg!(any(debug_assertions, feature = "feetest")) {
         return None;
     }
     let v: Vec<u64> = std::env::var("MH_FEE_TEST").ok()?.split(',').filter_map(|x| x.trim().parse().ok()).collect();
