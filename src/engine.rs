@@ -41,7 +41,7 @@ impl Algo {
     }
     /// can use graphics cards
     pub fn gpu_capable(self) -> bool {
-        self.gpu() || self == Algo::QPow
+        self.gpu() || self == Algo::QPow || self == Algo::Pearl
     }
 }
 

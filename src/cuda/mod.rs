@@ -86,6 +86,8 @@ pub struct Device {
     pub memory: u64,
     /// compute capability, e.g. (8, 9) for an RTX 40 card
     pub capability: (u32, u32),
+    /// PCI bus number, to tell which card of the sensor and OpenCL listings this is
+    pub pci_bus: Option<u32>,
 }
 
 /// NVIDIA cards the driver exposes (empty when there is no NVIDIA driver).
@@ -110,7 +112,9 @@ pub fn devices() -> Vec<Device> {
             (a.device_attr)(&mut major, 75, dev);
             (a.device_attr)(&mut minor, 76, dev);
             let name = std::ffi::CStr::from_ptr(name.as_ptr()).to_string_lossy().trim().to_string();
-            out.push(Device { index: i as usize, name, memory: mem as u64, capability: (major as u32, minor as u32) });
+            let mut bus = -1;
+            let pci_bus = ((a.device_attr)(&mut bus, 33, dev) == 0 && bus >= 0).then_some(bus as u32);
+            out.push(Device { index: i as usize, name, memory: mem as u64, capability: (major as u32, minor as u32), pci_bus });
         }
     }
     out

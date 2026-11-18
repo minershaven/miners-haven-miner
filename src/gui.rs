@@ -33,7 +33,7 @@ const ALGOS: [(&str, engine::Algo, &str); 6] = [
     ("firopow", engine::Algo::FiroPow, "FiroPoW  -  GPU  (Firo)"),
     ("progpowz", engine::Algo::ProgPowZ, "ProgPowZ  -  GPU  (Zano)"),
     ("qpow", engine::Algo::QPow, "QPoW  -  GPU + CPU  (Quantus)"),
-    ("pearl", engine::Algo::Pearl, "pearlhash  -  CPU for now  (Pearl)"),
+    ("pearl", engine::Algo::Pearl, "pearlhash  -  NVIDIA RTX or CPU  (Pearl)"),
 ];
 
 /// Semibold text at this size.
@@ -180,6 +180,8 @@ struct App {
     hp: Status,
     cores: usize,
     gpus: Vec<mhminer::gpu::cl::GpuInfo>,
+    /// numbers of the listed cards that can mine Pearl (NVIDIA RTX 30 series and newer)
+    pearl_cards: Vec<usize>,
     /// last ping results: (coin id, EU ms, US ms)
     pings: Arc<Mutex<Option<(String, Option<u32>, Option<u32>)>>>,
     ping_coin: String,
@@ -198,6 +200,7 @@ impl App {
             hp,
             cores: num_cpus::get(),
             gpus: mhminer::gpu::list_gpus(),
+            pearl_cards: mhminer::pearlminer::cards().into_iter().filter_map(|(_, g)| g.map(|g| g.index)).collect(),
             pings: Arc::new(Mutex::new(None)),
             ping_coin: String::new(),
             error: None,
@@ -557,8 +560,13 @@ impl App {
         }
 
         let algo = self.s.algo();
-        if !algo.gpu() {
-            let min = if algo.gpu_capable() && !self.gpus.is_empty() { 0 } else { 1 };
+        // the cards this algorithm can use
+        let cards: Vec<_> = self.gpus.iter().filter(|g| algo != engine::Algo::Pearl || self.pearl_cards.contains(&g.index)).cloned().collect();
+        let ticked = |sel: &Vec<usize>, i: usize| sel.is_empty() || (sel.contains(&i) && *sel != vec![usize::MAX]);
+        // Pearl on a card keys its work on a few processor threads of its own
+        let pearl_on_card = algo == engine::Algo::Pearl && cards.iter().any(|g| ticked(&self.s.gpus, g.index));
+        if !algo.gpu() && !pearl_on_card {
+            let min = if algo.gpu_capable() && !cards.is_empty() { 0 } else { 1 };
             self.s.threads = self.s.threads.max(min);
             section(ui, &format!("CPU threads  ({} available)", self.cores));
             ui.spacing_mut().slider_width = ui.available_width() - 56.0;
@@ -569,13 +577,20 @@ impl App {
         }
         if algo.gpu_capable() {
             section(ui, "Graphics cards");
-            if self.gpus.is_empty() {
+            if algo == engine::Algo::Pearl {
+                if cards.is_empty() {
+                    ui.label(RichText::new("No NVIDIA RTX card found (30 series or newer) - Pearl will run on the processor, which is slow.").color(WARN));
+                } else if pearl_on_card {
+                    hint(ui, "The card does the work; a few processor threads prepare it.");
+                }
+            } else if cards.is_empty() {
                 ui.label(RichText::new("No OpenCL GPU found - install the latest NVIDIA or AMD driver.").color(WARN));
             }
-            for g in self.gpus.clone() {
-                let mut on = self.s.gpus.is_empty() || (self.s.gpus.contains(&g.index) && self.s.gpus != vec![usize::MAX]);
+            for g in cards.clone() {
+                let mut on = ticked(&self.s.gpus, g.index);
                 if ui.checkbox(&mut on, format!("GPU{}  {}  ({:.0} GB)", g.index, g.name, g.memory as f64 / 1073741824.0)).changed() {
                     let mut sel: Vec<usize> = if self.s.gpus.is_empty() { self.gpus.iter().map(|x| x.index).collect() } else { self.s.gpus.clone() };
+                    sel.retain(|x| *x != usize::MAX);
                     if on { if !sel.contains(&g.index) { sel.push(g.index); } } else { sel.retain(|x| *x != g.index); }
                     sel.sort();
                     // all selected is stored as "all", so new cards get used too
