@@ -64,6 +64,10 @@ struct Args {
     /// Check that this machine computes RandomX hashes correctly, then exit
     #[arg(long)]
     selftest: bool,
+
+    /// Development check of the NVIDIA tensor-core path, then exit
+    #[arg(long, hide = true)]
+    cuda_probe: bool,
 }
 
 fn main() {
@@ -71,6 +75,13 @@ fn main() {
     banner();
     let log: Log = Arc::new(|m: &str| println!("[{}] {m}", engine::timestamp()));
 
+    if args.cuda_probe {
+        match mhminer::cuda::probe::run() {
+            Ok(report) => println!("{report}"),
+            Err(e) => println!(" CUDA probe failed: {e}"),
+        }
+        return;
+    }
     if args.selftest {
         let res = rxminer::selftest();
         for (input, pass) in &res {
