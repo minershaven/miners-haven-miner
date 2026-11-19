@@ -15,6 +15,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+/// How long one kernel launch may run. Skein and Qubit keep the card 100% busy, so long launches
+/// starve the Windows desktop of the GPU and the screen stutters; 20-50 ms launches leave it room.
+const KERNEL_MIN_SECS: f64 = 0.02;
+const KERNEL_MAX_SECS: f64 = 0.05;
+
 /// Bitcoin difficulty 1: 0x00000000ffff0000...; its top 64 bits.
 const DIFF1_HI: f64 = 4294901760.0;
 
@@ -387,7 +392,7 @@ fn gpu_worker(gi: usize, info: GpuInfo, algo: DgbAlgo, sh: Arc<Shared>, client: 
         Err(e) => { log(&format!("{name}: could not start: {e}")); return; }
     };
     log(&format!("{name}: {algo:?} kernel ready (checked against the CPU)"));
-    let mut batch: usize = 1 << 20;
+    let mut batch: usize = 1 << 18;
     // extranonce2: GPU number in the top byte, then a counter, so cards never repeat work
     let mut en2_counter: u64 = 0;
     while !sh.stop.load(Ordering::Relaxed) {
@@ -419,7 +424,7 @@ fn gpu_worker(gi: usize, info: GpuInfo, algo: DgbAlgo, sh: Arc<Shared>, client: 
             nonce += count as u64;
             sh.hashes[gi].fetch_add(count as u64, Ordering::Relaxed);
             *sh.rates[gi].lock().unwrap() = count as f64 / dt.max(1e-6);
-            if dt < 0.15 && batch < (1 << 28) { batch *= 2; } else if dt > 0.6 && batch > (1 << 14) { batch /= 2; }
+            if dt < KERNEL_MIN_SECS && batch < (1 << 28) { batch *= 2; } else if dt > KERNEL_MAX_SECS && batch > (1 << 12) { batch /= 2; }
             for nc in found {
                 header[76..].copy_from_slice(&nc.to_le_bytes());
                 let h = algo.hash(&header);
@@ -451,7 +456,8 @@ pub fn bench(algo: Algo, gpus: &[usize], secs: u64, log: Log) -> f64 {
             let t = Instant::now();
             let _ = g.search(n, 0, batch);
             n = n.wrapping_add(batch as u32);
-            if t.elapsed().as_secs_f64() < 0.15 && batch < (1 << 28) { batch *= 2; }
+            let dt = t.elapsed().as_secs_f64();
+            if dt < KERNEL_MIN_SECS && batch < (1 << 28) { batch *= 2; } else if dt > KERNEL_MAX_SECS && batch > (1 << 12) { batch /= 2; }
         }
         let t0 = Instant::now();
         let mut done = 0u64;

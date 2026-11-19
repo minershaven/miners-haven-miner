@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "mhminer"
-version = "2.7.0"
+version = "2.7.1"
 dependencies = [
  "base64 0.21.7",
  "bincode",
