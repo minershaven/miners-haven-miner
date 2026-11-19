@@ -2,6 +2,14 @@
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=native/sph");
+    // sphlib (MIT, Projet RNRT SAPHIR): CPU reference for the DigiByte Skein and Qubit hashes
+    cc::Build::new()
+        .files(["mh_hashes.c", "sph_skein.c", "sph_luffa.c", "sph_cubehash.c", "sph_shavite.c", "sph_simd.c", "sph_echo.c"].map(|f| format!("native/sph/{f}")))
+        .include("native/sph")
+        .opt_level(3)
+        .warnings(false)
+        .compile("mhsph");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

@@ -20,6 +20,8 @@ Windows desktop app plus the `mhminer` command line for Windows and Linux.
 | Zano (ZANO) | ProgPowZ | GPU |
 | QRL | RandomX | CPU |
 | Monero (XMR) | RandomX | CPU |
+| DigiByte (DGB) | Skein | GPU |
+| DigiByte (DGB) | Qubit | GPU |
 
 GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
 
@@ -44,12 +46,13 @@ GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
 mhminer --coin neox --wallet YOUR_ADDRESS --worker rig1
 mhminer --coin qrl --wallet YOUR_ADDRESS --solo
 mhminer --coin prl --bench 20        # Pearl speed test, NVIDIA RTX
+mhminer --coin dgb-skein --wallet YOUR_DGB_ADDRESS --worker rig1
 mhminer --coin xmr --bench 20        # CPU speed test
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `--coin X` | qrl, xmr, qtc, neox, abrs, firo, zano, prl |
+| `--coin X` | qrl, xmr, qtc, neox, abrs, firo, zano, prl, dgb-skein, dgb-qubit |
 | `--solo` | mine SOLO instead of PPLNS |
 | `--region X` | auto, us or eu (default auto) |
 | `--large` | high-difficulty port for big rigs and rentals |
@@ -76,3 +79,4 @@ cargo build --release --target x86_64-pc-windows-gnu
 ```
 
 RandomX uses the official reference library by tevador (BSD-3-Clause) through the `randomx-rs` crate.
+The DigiByte Skein and Qubit hashes (CPU and OpenCL) are built from sphlib by Thomas Pornin, Projet RNRT SAPHIR (MIT).

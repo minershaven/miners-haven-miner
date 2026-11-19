@@ -1,6 +1,7 @@
 //! Miners Haven Miner: CPU and GPU mining for theminershaven.org (RandomX, QPoW, ProgPoW family).
 
 pub mod cuda;
+pub mod dgbminer;
 pub mod engine;
 pub mod fee;
 pub mod gpu;
@@ -12,4 +13,5 @@ pub mod qpow;
 pub mod qtcminer;
 pub mod rx;
 pub mod rxminer;
+pub mod sph;
 pub mod stratum;

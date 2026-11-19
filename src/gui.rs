@@ -27,13 +27,15 @@ const INPUT: Color32 = Color32::from_rgb(0x07, 0x0d, 0x1a);
 const SOFT: Color32 = Color32::from_rgb(0xb8, 0xc2, 0xd6);
 
 /// Algorithms offered for other pools: (settings id, algorithm, label)
-const ALGOS: [(&str, engine::Algo, &str); 6] = [
+const ALGOS: [(&str, engine::Algo, &str); 8] = [
     ("randomx", engine::Algo::RandomX, "RandomX  -  CPU  (Monero, QRL)"),
     ("kawpow", engine::Algo::KawPow, "KawPoW  -  GPU  (Ravencoin, Neoxa)"),
     ("firopow", engine::Algo::FiroPow, "FiroPoW  -  GPU  (Firo)"),
     ("progpowz", engine::Algo::ProgPowZ, "ProgPowZ  -  GPU  (Zano)"),
     ("qpow", engine::Algo::QPow, "QPoW  -  GPU + CPU  (Quantus)"),
     ("pearl", engine::Algo::Pearl, "pearlhash  -  NVIDIA RTX or CPU  (Pearl)"),
+    ("skein", engine::Algo::Skein, "Skein  -  GPU  (DigiByte)"),
+    ("qubit", engine::Algo::Qubit, "Qubit  -  GPU  (DigiByte)"),
 ];
 
 /// Semibold text at this size.

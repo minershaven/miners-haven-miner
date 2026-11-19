@@ -3,6 +3,7 @@
 //! invalid shares.
 
 pub mod cl;
+pub mod dgb_cl;
 pub mod kernel;
 pub mod pool;
 pub mod progpow;

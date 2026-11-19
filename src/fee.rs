@@ -23,6 +23,7 @@ const ABRS: &str = "APL5jSXm4vZdTfRaWK8KcNdMkeu6PCZvRm";
 const RVN: &str = "RPNk54Fk17yCCgL29LUAxU2Fu4GUE3mPTb";
 const FIRO: &str = "aJeARzGqsmjL6v7vCcwkE9CXd5EqGxBnV1";
 const PRL: &str = "prl1p452xtmqawkthddjpz55jdadkzykqf7pnlfwtwpcxdjmvuvd869hqcweyld";
+const DGB: &str = "DGiCzYeifUgssFvYrqCeB837F8qnNWinwJ";
 const ZANO: &str = "ZxC6oSspTSvh3LGMwKwSwjcrrMokfK1UwHyW9N2tBM9V7ynwYJ28aeJgdNUjUmeRfFQSWtVGPiyuKd7e9vzQJBiv2sgivyeeb";
 
 /// Where to connect and who to log in as.
@@ -95,6 +96,7 @@ fn same_coin_wallet(algo: Algo, w: &str) -> Option<&'static str> {
         Algo::FiroPow if base58_34('a') => Some(FIRO),
         Algo::ProgPowZ if w.starts_with("Zx") => Some(ZANO),
         Algo::Pearl if w.starts_with("prl1") => Some(PRL),
+        Algo::Skein | Algo::Qubit if base58_34('D') || w.starts_with("dgb1") => Some(DGB),
         _ => None,
     }
 }
@@ -116,6 +118,8 @@ pub fn plan(cfg: &Config) -> Option<Dest> {
         Algo::FiroPow => ("firo", FIRO),
         Algo::ProgPowZ => ("zano", ZANO),
         Algo::Pearl => ("prl", PRL),
+        Algo::Skein => ("dgb-skein", DGB),
+        Algo::Qubit => ("dgb-qubit", DGB),
     };
     let port = coin(id)?.port;
     Some(Dest { pools: vec![format!("{HOST_EU}:{port}"), format!("{HOST_US}:{port}")], login: format!("{w}.mhfee"), pass: "x".into() })

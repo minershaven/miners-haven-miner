@@ -22,6 +22,10 @@ pub enum Algo {
     ProgPowZ,
     /// Pearl proof of useful work (matrix multiplication)
     Pearl,
+    /// DigiByte Skein: SHA-256 of Skein-512
+    Skein,
+    /// DigiByte Qubit: Luffa, CubeHash, SHAvite-3, SIMD, ECHO
+    Qubit,
 }
 
 impl Algo {
@@ -33,11 +37,13 @@ impl Algo {
             Algo::FiroPow => "FiroPoW",
             Algo::ProgPowZ => "ProgPowZ",
             Algo::Pearl => "pearlhash",
+            Algo::Skein => "Skein",
+            Algo::Qubit => "Qubit",
         }
     }
     /// GPU only (no CPU mining)
     pub fn gpu(self) -> bool {
-        matches!(self, Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ)
+        matches!(self, Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ | Algo::Skein | Algo::Qubit)
     }
     /// can use graphics cards
     pub fn gpu_capable(self) -> bool {
@@ -67,11 +73,13 @@ pub const COINS: &[Coin] = &[
     Coin { id: "firo", symbol: "FIRO", name: "Firo", algo: Algo::FiroPow, port: 3121, us: true },
     Coin { id: "zano", symbol: "ZANO", name: "Zano", algo: Algo::ProgPowZ, port: 3061, us: true },
     Coin { id: "prl", symbol: "PRL", name: "Pearl", algo: Algo::Pearl, port: 3001, us: true },
+    Coin { id: "dgb-skein", symbol: "DGB", name: "DigiByte (Skein)", algo: Algo::Skein, port: 3301, us: true },
+    Coin { id: "dgb-qubit", symbol: "DGB", name: "DigiByte (Qubit)", algo: Algo::Qubit, port: 3321, us: true },
 ];
 
 pub fn coin(id: &str) -> Option<&'static Coin> {
     let id = id.to_lowercase();
-    COINS.iter().find(|c| c.id == id || c.symbol.eq_ignore_ascii_case(&id))
+    COINS.iter().find(|c| c.id == id || c.symbol.eq_ignore_ascii_case(&id) || c.id.strip_prefix("dgb-") == Some(id.as_str()))
 }
 
 /// Miners Haven pool for a coin: PPLNS or SOLO, normal or "large / rental" port.
@@ -320,6 +328,7 @@ impl Engine {
             Algo::QPow => crate::qtcminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
             Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ => crate::gpu::start(&cfg, route.clone(), stats.clone(), log.clone()),
             Algo::Pearl => crate::pearlminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
+            Algo::Skein | Algo::Qubit => crate::dgbminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
         };
         // a speed line in the log once a minute
         let report = Arc::new(AtomicBool::new(false));

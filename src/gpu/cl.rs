@@ -27,7 +27,9 @@ pub struct GpuInfo {
 
 /// All OpenCL GPUs on this computer (empty if there's no OpenCL driver).
 pub fn list_gpus() -> Vec<GpuInfo> {
-    let Ok(ids) = get_all_devices(CL_DEVICE_TYPE_GPU) else { return vec![] };
+    // MH_CL_ALL=1 also lists OpenCL processors (testing on machines without a graphics card)
+    let kind = if std::env::var("MH_CL_ALL").is_ok() { opencl3::device::CL_DEVICE_TYPE_ALL } else { CL_DEVICE_TYPE_GPU };
+    let Ok(ids) = get_all_devices(kind) else { return vec![] };
     let mut nv_count = 0usize;
     ids.iter()
         .enumerate()
