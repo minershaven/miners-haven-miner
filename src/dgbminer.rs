@@ -64,6 +64,12 @@ impl Work {
     }
 }
 
+/// Pool difficulty for display: a few significant digits (vardiff sends values like 41.668927363595566).
+pub fn short_diff(d: f64) -> String {
+    if d >= 1e9 { format!("{:.2}G", d / 1e9) } else if d >= 1e6 { format!("{:.2}M", d / 1e6) } else if d >= 1e4 { format!("{:.1}k", d / 1e3) }
+    else if d >= 100.0 { format!("{d:.0}") } else if d >= 1.0 { format!("{d:.2}") } else { format!("{d:.4}") }
+}
+
 /// Top 64 bits of the share target for a pool difficulty.
 pub fn target_hi(diff: f64) -> u64 {
     let t = DIFF1_HI / diff.max(1e-12);
@@ -357,7 +363,7 @@ pub fn start(cfg: &Config, route: Arc<crate::fee::Route>, stats: Arc<Stats>, log
                 match rx.recv_timeout(Duration::from_millis(500)) {
                     Ok(Msg::Diff(d)) => {
                         sh.diff.store(d.to_bits(), Ordering::SeqCst);
-                        *st.diff_text.lock().unwrap() = format!("{d}");
+                        *st.diff_text.lock().unwrap() = short_diff(d);
                         st.difficulty.store(d.max(0.0) as u64, Ordering::Relaxed);
                     }
                     Ok(Msg::Job(mut w, clean)) => {
@@ -365,7 +371,7 @@ pub fn start(cfg: &Config, route: Arc<crate::fee::Route>, stats: Arc<Stats>, log
                         // DigiByte has a block every 15 s; only mention jobs when the difficulty changes
                         let prev = sh.work.read().unwrap().as_ref().map(|p| p.difficulty);
                         if clean && prev != Some(w.difficulty) {
-                            lg(&format!("new job  diff {}", w.difficulty));
+                            lg(&format!("new job  diff {}", short_diff(w.difficulty)));
                         }
                         st.set_status("mining");
                         *sh.work.write().unwrap() = Some(Arc::new(w));

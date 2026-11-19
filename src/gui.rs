@@ -430,7 +430,15 @@ fn card(ui: &mut egui::Ui, label: &str, value: String, color: Color32) {
             ui.set_min_width(ui.available_width());
             ui.spacing_mut().item_spacing.y = 4.0;
             ui.label(RichText::new(label.to_uppercase()).font(sb(10.5)).color(MUTED).extra_letter_spacing(0.7));
-            ui.label(RichText::new(value).font(sb(23.0)).color(color));
+            // one line that never wraps: shrink the font when the value is wider than the card, so the
+            // cards don't jump between one and two lines as the numbers change
+            let w = ui.available_width().max(20.0);
+            let mut size = 23.0;
+            let wide = |sz: f32| ui.painter().layout_no_wrap(value.clone(), sb(sz), color).size().x;
+            while size > 12.0 && wide(size) > w {
+                size -= 1.0;
+            }
+            ui.add(egui::Label::new(RichText::new(value).font(sb(size)).color(color)).wrap_mode(egui::TextWrapMode::Truncate));
         });
 }
 
