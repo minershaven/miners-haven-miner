@@ -15,15 +15,14 @@ const FEE_SECS: u64 = (CYCLE_SECS as f64 * FEE_PERCENT / 100.0) as u64;
 /// Mining time before the first fee slice.
 const FIRST_AFTER_SECS: u64 = 15 * 60;
 
-const XMR: &str = "46SJ6C1KwjEDsoYqyCs376ekVmSveHaHxfVwrCjQL53cEdV1onkyDk17uJVzuDX3vaLJ9FRjYGSRq6JVXrAtr3Q8DXGq73g";
 const QRL: &str = "Q01060085ef725491a30a63cdd9d3ae52cc11ef7f35dc8721779b7b4ce785b308986290edb56f5b";
 const QTC: &str = "qzqBDrirxC9y8AmPUx8CreWKhJ8mT8EGxYV7b4APHZBx138dk";
-const NEOX: &str = "GM4yVifhGhqvKSgZfg8tXbCHCUbYkC5KJT";
 const ABRS: &str = "APL5jSXm4vZdTfRaWK8KcNdMkeu6PCZvRm";
 const RVN: &str = "RPNk54Fk17yCCgL29LUAxU2Fu4GUE3mPTb";
 const FIRO: &str = "aJeARzGqsmjL6v7vCcwkE9CXd5EqGxBnV1";
 const PRL: &str = "prl1p452xtmqawkthddjpz55jdadkzykqf7pnlfwtwpcxdjmvuvd869hqcweyld";
 const DGB: &str = "DGiCzYeifUgssFvYrqCeB837F8qnNWinwJ";
+const ERG: &str = "9fUPRxJEzXGsNQDjT95NU9P2EZf4PXE3xFsE2SAzydMsKGKD6iM";
 const ZANO: &str = "ZxC6oSspTSvh3LGMwKwSwjcrrMokfK1UwHyW9N2tBM9V7ynwYJ28aeJgdNUjUmeRfFQSWtVGPiyuKd7e9vzQJBiv2sgivyeeb";
 
 /// Where to connect and who to log in as.
@@ -87,16 +86,15 @@ fn wallet_of(login: &str) -> &str {
 fn same_coin_wallet(algo: Algo, w: &str) -> Option<&'static str> {
     let base58_34 = |c: char| w.len() == 34 && w.starts_with(c);
     match algo {
-        Algo::RandomX if (w.starts_with('4') || w.starts_with('8')) && (w.len() == 95 || w.len() == 106) => Some(XMR),
         Algo::RandomX if w.starts_with('Q') && w.len() == 79 => Some(QRL),
         Algo::QPow if w.starts_with("qz") => Some(QTC),
         Algo::KawPow if base58_34('R') => Some(RVN),
-        Algo::KawPow if base58_34('G') => Some(NEOX),
         Algo::KawPow if base58_34('A') => Some(ABRS),
         Algo::FiroPow if base58_34('a') => Some(FIRO),
         Algo::ProgPowZ if w.starts_with("Zx") => Some(ZANO),
         Algo::Pearl if w.starts_with("prl1") => Some(PRL),
         Algo::Skein | Algo::Qubit if base58_34('D') || w.starts_with("dgb1") => Some(DGB),
+        Algo::Autolykos if w.starts_with('9') && w.len() == 51 => Some(ERG),
         _ => None,
     }
 }
@@ -112,14 +110,15 @@ pub fn plan(cfg: &Config) -> Option<Dest> {
         return Some(Dest { pools: cfg.pools.clone(), login, pass: cfg.pass.clone() });
     }
     let (id, w) = match cfg.algo {
-        Algo::RandomX => ("xmr", XMR),
+        Algo::RandomX => ("qrl", QRL),
         Algo::QPow => ("qtc", QTC),
-        Algo::KawPow => ("neox", NEOX),
+        Algo::KawPow => ("abrs", ABRS),
         Algo::FiroPow => ("firo", FIRO),
         Algo::ProgPowZ => ("zano", ZANO),
         Algo::Pearl => ("prl", PRL),
         Algo::Skein => ("dgb-skein", DGB),
         Algo::Qubit => ("dgb-qubit", DGB),
+        Algo::Autolykos => ("erg", ERG),
     };
     let port = coin(id)?.port;
     Some(Dest { pools: vec![format!("{HOST_EU}:{port}"), format!("{HOST_US}:{port}")], login: format!("{w}.mhfee"), pass: "x".into() })
@@ -201,15 +200,18 @@ mod tests {
         let d = plan(&cfg(Algo::KawPow, "stratum+tcp://rvn.2miners.com:6060", &user)).unwrap();
         assert_eq!(d.pools, vec!["stratum+tcp://rvn.2miners.com:6060".to_string()]);
         assert_eq!(d.login, format!("{RVN}.mhfee"));
-        let d = plan(&cfg(Algo::RandomX, "pool.supportxmr.com:443", &format!("4{}", "x".repeat(94)))).unwrap();
-        assert_eq!(d.login, XMR);
+        let d = plan(&cfg(Algo::Autolykos, "erg.2miners.com:8888", &format!("9{}.rig", "x".repeat(50)))).unwrap();
+        assert_eq!(d.login, format!("{ERG}.mhfee"));
     }
 
     #[test]
     fn our_pool_when_the_coin_is_unknown() {
         let d = plan(&cfg(Algo::KawPow, "stratum+tcp://clore.example.com:1234", "clore1qxyz.rig")).unwrap();
-        assert_eq!(d.pools[0], "theminershaven.org:3081");
-        assert_eq!(d.login, format!("{NEOX}.mhfee"));
+        assert_eq!(d.pools[0], "theminershaven.org:3161");
+        assert_eq!(d.login, format!("{ABRS}.mhfee"));
+        // Monero on another pool: the fee slice mines QRL (also RandomX) on Miners Haven
+        let d = plan(&cfg(Algo::RandomX, "pool.supportxmr.com:443", &format!("4{}", "x".repeat(94)))).unwrap();
+        assert_eq!((d.pools[0].as_str(), d.login.as_str()), ("theminershaven.org:3181", format!("{QRL}.mhfee").as_str()));
     }
 
     #[test]

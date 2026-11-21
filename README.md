@@ -14,14 +14,13 @@ Windows desktop app plus the `mhminer` command line for Windows and Linux.
 | --- | --- | --- |
 | Pearl (PRL) | Pearl | NVIDIA RTX 30-series or newer |
 | Quantus (QTC) | QPoW | GPU or CPU |
-| Neoxa (NEOX) | KawPoW | GPU |
 | ABRS | KawPoW | GPU |
 | Firo (FIRO) | FiroPoW | GPU |
 | Zano (ZANO) | ProgPowZ | GPU |
 | QRL | RandomX | CPU |
-| Monero (XMR) | RandomX | CPU |
 | DigiByte (DGB) | Skein | GPU |
 | DigiByte (DGB) | Qubit | GPU |
+| Ergo (ERG) | Autolykos2 | GPU with 8 GB or more |
 
 GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
 
@@ -36,23 +35,24 @@ GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
 - Desktop app: pick a coin, paste your wallet, press Start. Settings are remembered.
 - Picks the right Miners Haven pool and port for you; SOLO or PPLNS.
 - Region: auto (fastest), US (St. Louis) or EU (Germany), with the other server as backup.
-- Per-GPU speed, temperature, fan and power.
+- Per-GPU speed, temperature, fan and power, plus the processor temperature.
 - Huge pages for RandomX (about 10-20% faster).
 - Mines on other pools too: choose the algorithm and fill in pool, wallet and password.
 
 ## Command line
 
 ```
-mhminer --coin neox --wallet YOUR_ADDRESS --worker rig1
+mhminer --coin erg --wallet YOUR_ERGO_ADDRESS --worker rig1
 mhminer --coin qrl --wallet YOUR_ADDRESS --solo
 mhminer --coin prl --bench 20        # Pearl speed test, NVIDIA RTX
 mhminer --coin dgb-skein --wallet YOUR_DGB_ADDRESS --worker rig1
-mhminer --coin xmr --bench 20        # CPU speed test
+mhminer --coin qrl --bench 20        # CPU speed test
+mhminer --coin erg --bench 20        # Ergo speed test (builds the table first)
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `--coin X` | qrl, xmr, qtc, neox, abrs, firo, zano, prl, dgb-skein, dgb-qubit |
+| `--coin X` | qrl, qtc, abrs, firo, zano, prl, dgb-skein, dgb-qubit, erg |
 | `--solo` | mine SOLO instead of PPLNS |
 | `--region X` | auto, us or eu (default auto) |
 | `--large` | high-difficulty port for big rigs and rentals |

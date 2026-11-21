@@ -27,7 +27,7 @@ const INPUT: Color32 = Color32::from_rgb(0x07, 0x0d, 0x1a);
 const SOFT: Color32 = Color32::from_rgb(0xb8, 0xc2, 0xd6);
 
 /// Algorithms offered for other pools: (settings id, algorithm, label)
-const ALGOS: [(&str, engine::Algo, &str); 8] = [
+const ALGOS: [(&str, engine::Algo, &str); 9] = [
     ("randomx", engine::Algo::RandomX, "RandomX  -  CPU  (Monero, QRL)"),
     ("kawpow", engine::Algo::KawPow, "KawPoW  -  GPU  (Ravencoin, Neoxa)"),
     ("firopow", engine::Algo::FiroPow, "FiroPoW  -  GPU  (Firo)"),
@@ -36,6 +36,7 @@ const ALGOS: [(&str, engine::Algo, &str); 8] = [
     ("pearl", engine::Algo::Pearl, "pearlhash  -  NVIDIA RTX or CPU  (Pearl)"),
     ("skein", engine::Algo::Skein, "Skein  -  GPU  (DigiByte)"),
     ("qubit", engine::Algo::Qubit, "Qubit  -  GPU  (DigiByte)"),
+    ("autolykos", engine::Algo::Autolykos, "Autolykos2  -  GPU  (Ergo)"),
 ];
 
 /// Semibold text at this size.
@@ -316,9 +317,7 @@ impl App {
 fn wallet_warning(coin: &str, w: &str) -> Option<String> {
     match coin {
         "qrl" if !w.starts_with('Q') => Some("That doesn't look like a QRL address (they start with Q).".into()),
-        "xmr" if !(w.starts_with('4') || w.starts_with('8')) || w.len() < 90 => {
-            Some("That doesn't look like a Monero address (95 characters, starting with 4 or 8).".into())
-        }
+        "erg" if !w.starts_with('9') || w.len() != 51 => Some("That doesn't look like an Ergo address (51 characters, starting with 9).".into()),
         _ => None,
     }
 }
@@ -768,25 +767,30 @@ impl App {
             card(&mut c[2], "Rejected", rej.to_string(), if rej > 0 { RED } else { TEXT });
             card(&mut c[3], "Share diff", if diff_text.is_empty() { dash(diff) } else { diff_text.clone() }, TEXT);
         });
+        let temp_col = |t: u64, warm: u64, hot: u64| if t == 0 { MUTED } else if t >= hot { RED } else if t >= warm { WARN } else { GREEN };
+        let temp_text = |t: u64| if t == 0 { "-".to_string() } else { format!("{t}°C") };
+        let (cpu_t, gpu_t) = match &self.engine {
+            Some(e) => (e.stats.cpu_temp.load(Ordering::Relaxed), e.stats.gpu_temp.load(Ordering::Relaxed)),
+            None => (0, 0),
+        };
         ui.columns(4, |c| {
             card(&mut c[0], "Block height", dash(height), TEXT);
             card(&mut c[1], "Uptime", if self.running() { uptime(up) } else { "-".into() }, TEXT);
+            card(&mut c[2], "CPU temp", temp_text(cpu_t), temp_col(cpu_t, 80, 90));
             if gpu_coin {
-                let t = self.engine.as_ref().map(|e| e.stats.gpu_temp.load(Ordering::Relaxed)).unwrap_or(0);
-                let col = if t == 0 { MUTED } else if t >= 85 { RED } else if t >= 75 { WARN } else { GREEN };
-                card(&mut c[2], "GPU temp", if t == 0 { "-".into() } else { format!("{t}°C") }, col);
+                card(&mut c[3], "GPU temp", temp_text(gpu_t), temp_col(gpu_t, 75, 85));
             } else {
-                card(&mut c[2], "Huge pages", if !self.running() { "-".into() } else if huge { "On".into() } else { "Off".into() },
+                card(&mut c[3], "Huge pages", if !self.running() { "-".into() } else if huge { "On".into() } else { "Off".into() },
                     if huge { GREEN } else { MUTED });
             }
-            card(&mut c[3], "Pool", if conn { "Connected".into() } else if self.running() { "Connecting".into() } else { "-".into() },
-                if conn { GREEN } else { MUTED });
         });
-        if conn || !devices.is_empty() {
+        if self.running() || !devices.is_empty() {
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 3.0;
                 if conn {
-                    ui.label(RichText::new(format!("Connected to {pool}")).size(11.5).color(MUTED));
+                    ui.label(RichText::new(format!("•  Connected to {pool}")).size(11.5).color(GREEN));
+                } else if self.running() {
+                    ui.label(RichText::new("•  Connecting to the pool...").size(11.5).color(MUTED));
                 }
                 for d in &devices {
                     ui.label(RichText::new(d).monospace().size(12.0).color(SOFT));

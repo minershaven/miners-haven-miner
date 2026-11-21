@@ -26,6 +26,8 @@ pub enum Algo {
     Skein,
     /// DigiByte Qubit: Luffa, CubeHash, SHAvite-3, SIMD, ECHO
     Qubit,
+    /// Ergo: Autolykos v2 (memory-hard; the table is rebuilt every block)
+    Autolykos,
 }
 
 impl Algo {
@@ -39,11 +41,12 @@ impl Algo {
             Algo::Pearl => "pearlhash",
             Algo::Skein => "Skein",
             Algo::Qubit => "Qubit",
+            Algo::Autolykos => "Autolykos2",
         }
     }
     /// GPU only (no CPU mining)
     pub fn gpu(self) -> bool {
-        matches!(self, Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ | Algo::Skein | Algo::Qubit)
+        matches!(self, Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ | Algo::Skein | Algo::Qubit | Algo::Autolykos)
     }
     /// can use graphics cards
     pub fn gpu_capable(self) -> bool {
@@ -66,15 +69,14 @@ pub struct Coin {
 
 pub const COINS: &[Coin] = &[
     Coin { id: "qrl", symbol: "QRL", name: "QRL", algo: Algo::RandomX, port: 3181, us: true },
-    Coin { id: "xmr", symbol: "XMR", name: "Monero", algo: Algo::RandomX, port: 3141, us: true },
     Coin { id: "qtc", symbol: "QTC", name: "Quantus", algo: Algo::QPow, port: 3101, us: true },
-    Coin { id: "neox", symbol: "NEOX", name: "Neoxa", algo: Algo::KawPow, port: 3081, us: true },
     Coin { id: "abrs", symbol: "ABRS", name: "Aurora Borealis", algo: Algo::KawPow, port: 3161, us: true },
     Coin { id: "firo", symbol: "FIRO", name: "Firo", algo: Algo::FiroPow, port: 3121, us: true },
     Coin { id: "zano", symbol: "ZANO", name: "Zano", algo: Algo::ProgPowZ, port: 3061, us: true },
     Coin { id: "prl", symbol: "PRL", name: "Pearl", algo: Algo::Pearl, port: 3001, us: true },
     Coin { id: "dgb-skein", symbol: "DGB", name: "DigiByte (Skein)", algo: Algo::Skein, port: 3301, us: true },
     Coin { id: "dgb-qubit", symbol: "DGB", name: "DigiByte (Qubit)", algo: Algo::Qubit, port: 3321, us: true },
+    Coin { id: "erg", symbol: "ERG", name: "Ergo", algo: Algo::Autolykos, port: 3361, us: true },
 ];
 
 pub fn coin(id: &str) -> Option<&'static Coin> {
@@ -167,7 +169,7 @@ pub fn pool_list(coin_id: &str, solo: bool, large: bool, region: Region, pings: 
 /// Pool id on theminershaven.org (for the stats page link).
 pub fn pool_id(coin_id: &str, solo: bool) -> String {
     let c = coin(coin_id).map(|c| c.id).unwrap_or(coin_id);
-    let c = if c == "prl" { "pearl" } else { c };
+    let c = match c { "prl" => "pearl", other => other };
     format!("{c}-{}", if solo { "solo" } else { "pplns" })
 }
 
@@ -208,6 +210,8 @@ pub struct Stats {
     pub diff_text: Mutex<String>,
     /// hottest GPU in °C (0 = unknown / not a GPU coin)
     pub gpu_temp: AtomicU64,
+    /// processor temperature in °C (0 = not reported by this computer)
+    pub cpu_temp: AtomicU64,
     /// A dev fee slice is running: shares and connections belong to the developer, not the user.
     pub fee: AtomicBool,
     /// When the connection last moved between the user's pool and the dev fee destination.
@@ -231,6 +235,7 @@ impl Stats {
             devices: Mutex::new(Vec::new()),
             diff_text: Mutex::new(String::new()),
             gpu_temp: AtomicU64::new(0),
+            cpu_temp: AtomicU64::new(0),
             fee: AtomicBool::new(false),
             switched: Mutex::new(Instant::now() - Duration::from_secs(3600)),
             started: Instant::now(),
@@ -329,6 +334,7 @@ impl Engine {
             Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ => crate::gpu::start(&cfg, route.clone(), stats.clone(), log.clone()),
             Algo::Pearl => crate::pearlminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
             Algo::Skein | Algo::Qubit => crate::dgbminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
+            Algo::Autolykos => crate::ergominer::start(&cfg, route.clone(), stats.clone(), log.clone()),
         };
         // a speed line in the log once a minute
         let report = Arc::new(AtomicBool::new(false));
@@ -336,11 +342,28 @@ impl Engine {
             let (st, stop, lg) = (stats.clone(), report.clone(), log.clone());
             std::thread::spawn(move || {
                 let mut n = 0;
+                let mut hot = false;
                 while !stop.load(Ordering::SeqCst) {
                     std::thread::sleep(Duration::from_secs(1));
                     n += 1;
+                    if n % 3 == 1 {
+                        let c = crate::cputemp::read().map(|c| c.round() as u64).unwrap_or(0);
+                        st.cpu_temp.store(c, Ordering::Relaxed);
+                        if c >= 95 && !hot {
+                            lg(&format!("the processor is running hot ({c}C) - check its cooler"));
+                        }
+                        hot = c >= 90;
+                    }
                     if n % 60 == 0 {
-                        lg(&format!("speed {}  accepted {}  rejected {}", hr(*st.hashrate.lock().unwrap()),
+                        let mut temps = String::new();
+                        let (c, g) = (st.cpu_temp.load(Ordering::Relaxed), st.gpu_temp.load(Ordering::Relaxed));
+                        if c > 0 {
+                            temps += &format!("  CPU {c}C");
+                        }
+                        if g > 0 {
+                            temps += &format!("  GPU {g}C");
+                        }
+                        lg(&format!("speed {}  accepted {}  rejected {}{temps}", hr(*st.hashrate.lock().unwrap()),
                             st.accepted.load(Ordering::Relaxed), st.rejected.load(Ordering::Relaxed)));
                         for d in st.devices.lock().unwrap().iter() {
                             lg(&format!("  {d}"));

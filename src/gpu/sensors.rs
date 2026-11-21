@@ -180,3 +180,31 @@ fn amd_hwmon(pci_bus: Option<u32>) -> Reading {
 fn amd_hwmon(_pci_bus: Option<u32>) -> Reading {
     Reading::default()
 }
+
+/// Every 2 s: one line per card (speed from `rate`, then temperature, fan and power) into
+/// `stats.devices`, the hottest card into `stats.gpu_temp`, and a warning in the log when a card runs hot.
+pub fn spawn_monitor(gpus: Vec<super::cl::GpuInfo>, stats: std::sync::Arc<crate::engine::Stats>, stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    log: crate::engine::Log, rate: std::sync::Arc<dyn Fn(usize) -> String + Send + Sync>) -> std::thread::JoinHandle<()> {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    std::thread::spawn(move || {
+        let sensors = Sensors::new();
+        let mut hot = Instant::now() - Duration::from_secs(600);
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_secs(2));
+            let mut lines = Vec::new();
+            let mut hottest = 0u32;
+            for (i, g) in gpus.iter().enumerate() {
+                let rd = sensors.read(g.nvidia, g.pci_bus, g.nvidia_index);
+                hottest = hottest.max(rd.temp_c.unwrap_or(0));
+                lines.push(format!("GPU{} {}   {:>14}   {}", g.index, g.name, rate(i), rd.text()));
+                if rd.temp_c.unwrap_or(0) >= 85 && hot.elapsed() > Duration::from_secs(300) {
+                    hot = Instant::now();
+                    log(&format!("GPU{} is running hot ({}C) - check its fans and airflow", g.index, rd.temp_c.unwrap()));
+                }
+            }
+            stats.gpu_temp.store(hottest as u64, Ordering::Relaxed);
+            *stats.devices.lock().unwrap() = lines;
+        }
+    })
+}
