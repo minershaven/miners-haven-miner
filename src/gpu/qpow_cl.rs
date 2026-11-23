@@ -31,17 +31,28 @@ fn list(name: &str, v: &[u64]) -> String {
 }
 
 /// The permutation as straight-line code with every round constant written in as a literal.
+/// With LAZY (NVIDIA only), each external linear layer is summed without per-addition reductions
+/// and the next round's constants are folded into its single reduction (EXT_LAZY).
 fn permute_code() -> String {
-    let mut c = String::from("inline void permute(ulong* s) {\n    ext_layer(s);\n");
-    let ext = |c: &mut String, rc: &[u64; 12]| {
+    let mut c = String::from("inline void permute(ulong* s) {\n");
+    // external layer followed by the S-boxes of a full round with these constants
+    let ext_rc = |c: &mut String, rc: &[u64; 12]| {
+        let list: Vec<String> = rc.iter().map(|x| format!("0x{x:016x}UL")).collect();
+        let _ = writeln!(c, "#if defined(LAZY)\n    {{ const ulong rc[12] = {{{}}};\n    EXT_LAZY(s, rc, RC_YES)\n    }}", list.join(", "));
+        for i in 0..12 {
+            let _ = writeln!(c, "    s[{i}] = exp7(s[{i}]);");
+        }
+        c.push_str("#else\n    ext_layer(s);\n");
         for i in 0..12 {
             let _ = writeln!(c, "    s[{i}] = exp7(gadd(s[{i}], 0x{:016x}UL));", rc[i]);
         }
-        c.push_str("    ext_layer(s);\n");
+        c.push_str("#endif\n");
     };
+    let ext_plain = |c: &mut String| c.push_str("#if defined(LAZY)\n    EXT_LAZY(s, 0, RC_NONE)\n#else\n    ext_layer(s);\n#endif\n");
     for r in 0..4 {
-        ext(&mut c, &INITIAL_EXTERNAL_CONSTANTS[r]);
+        ext_rc(&mut c, &INITIAL_EXTERNAL_CONSTANTS[r]);
     }
+    ext_plain(&mut c);
     for r in 0..22 {
         let _ = writeln!(c, "    s[0] = exp7(gadd(s[0], 0x{:016x}UL));", INTERNAL_CONSTANTS[r]);
         c.push_str("    { ulong lo = s[0]; uint k = 0;\n");
@@ -54,9 +65,20 @@ fn permute_code() -> String {
         }
         c.push_str("    }\n");
     }
+    // the external layer that ends the partial rounds is the first of the terminal full rounds
+    let mut first = true;
     for r in 0..4 {
-        ext(&mut c, &TERMINAL_EXTERNAL_CONSTANTS[r]);
+        if first {
+            // terminal round 1: S-boxes on the partial-round output, then its external layer
+            for i in 0..12 {
+                let _ = writeln!(c, "    s[{i}] = exp7(gadd(s[{i}], 0x{:016x}UL));", TERMINAL_EXTERNAL_CONSTANTS[r][i]);
+            }
+            first = false;
+        } else {
+            ext_rc(&mut c, &TERMINAL_EXTERNAL_CONSTANTS[r]);
+        }
     }
+    ext_plain(&mut c);
     c.push_str("}\n");
     c
 }
@@ -172,7 +194,68 @@ inline ulong gmuladd(ulong a, ulong b, ulong c) {
 #else
 #define ACC(lo, k, x) { lo += (x); k += (uint)(lo < (x)); }
 #endif
-inline ulong exp7(ulong x) { ulong x2 = gmul(x, x); ulong x3 = gmul(x2, x); ulong x4 = gmul(x2, x2); return gmul(x3, x4); }
+#if defined(SQR3)
+/* a*a from three 32x32 products: a0^2, a1^2 and a0*a1 (doubled by shifting) */
+inline ulong gsqr(ulong a) {
+    ulong lo, hi;
+    asm("{\n\t.reg .u32 a0, a1;\n\t.reg .u64 p00, p11, p01, cl, ch;\n\t"
+        "mov.b64 {a0, a1}, %2;\n\t"
+        "mul.wide.u32 p00, a0, a0;\n\t" "mul.wide.u32 p11, a1, a1;\n\t" "mul.wide.u32 p01, a0, a1;\n\t"
+        "shl.b64 cl, p01, 33;\n\t" "shr.b64 ch, p01, 31;\n\t"
+        "add.cc.u64 %0, p00, cl;\n\t" "addc.u64 %1, p11, ch;\n\t}" : "=l"(lo), "=l"(hi) : "l"(a));
+    return red128(lo, hi);
+}
+#else
+inline ulong gsqr(ulong a) { return gmul(a, a); }
+#endif
+inline ulong exp7(ulong x) { ulong x2 = gsqr(x); ulong x3 = gmul(x2, x); ulong x4 = gsqr(x2); return gmul(x3, x4); }
+
+#if defined(LAZY)
+/* ---- lazy external layer (NVIDIA) -----------------------------------------------------
+   The external layer only adds (coefficients up to 64 per output), so each output is kept as a
+   64-bit value plus a carry count (below 2^7) and reduced once, with the next round constants
+   folded in: x + h*2^64 = x + h*(2^32 - 1) (mod P). The rare borrow of "x - h" is not corrected,
+   as in RED_PTX; candidates are re-hashed on the CPU. */
+#define WADD(dl, dh, al, ah, bl, bh) asm("add.cc.u64 %0, %2, %4;\n\taddc.u32 %1, %3, %5;" : "=l"(dl), "=r"(dh) : "l"(al), "r"(ah), "l"(bl), "r"(bh))
+inline ulong wred(ulong l, uint h) {
+    ulong r;
+    asm("{\n\t.reg .u32 l0, l1, c;\n\t"
+        "mov.b64 {l0, l1}, %1;\n\t"
+        "sub.cc.u32 l0, l0, %2;\n\t" "subc.u32 l1, l1, 0;\n\t"
+        "add.cc.u32 l1, l1, %2;\n\t" "addc.u32 c, 0, 0;\n\t"
+        "add.u32 l1, l1, c;\n\t" "sub.cc.u32 l0, l0, c;\n\t" "subc.u32 l1, l1, 0;\n\t"
+        "mov.b64 %0, {l0, l1};\n\t}" : "=l"(r) : "l"(l), "r"(h));
+    return r;
+}
+#define RC_NONE(yl, yh, i, RC)
+#define RC_YES(yl, yh, i, RC) WADD(yl, yh, yl, yh, RC[i], 0u)
+#define EXT_LAZY(s, RC, RC_ADD) { \
+    ulong nl[12]; uint nh[12]; \
+    _Pragma("unroll") for (int b = 0; b < 12; b += 4) { \
+        ulong x0 = s[b], x1 = s[b + 1], x2 = s[b + 2], x3 = s[b + 3]; \
+        ulong t01l, t23l, tal, t1l, t3l, d0l, d2l; uint t01h, t23h, tah, t1h, t3h, d0h, d2h; \
+        WADD(t01l, t01h, x0, 0u, x1, 0u); WADD(t23l, t23h, x2, 0u, x3, 0u); \
+        WADD(tal, tah, t01l, t01h, t23l, t23h); \
+        WADD(t1l, t1h, tal, tah, x1, 0u); WADD(t3l, t3h, tal, tah, x3, 0u); \
+        WADD(d0l, d0h, x0, 0u, x0, 0u); WADD(d2l, d2h, x2, 0u, x2, 0u); \
+        WADD(nl[b + 3], nh[b + 3], t3l, t3h, d0l, d0h); \
+        WADD(nl[b + 1], nh[b + 1], t1l, t1h, d2l, d2h); \
+        WADD(nl[b], nh[b], t1l, t1h, t01l, t01h); \
+        WADD(nl[b + 2], nh[b + 2], t3l, t3h, t23l, t23h); \
+    } \
+    _Pragma("unroll") for (int k = 0; k < 4; k++) { \
+        ulong sl; uint sh; \
+        WADD(sl, sh, nl[k], nh[k], nl[4 + k], nh[4 + k]); \
+        WADD(sl, sh, sl, sh, nl[8 + k], nh[8 + k]); \
+        _Pragma("unroll") for (int b = 0; b < 12; b += 4) { \
+            ulong yl; uint yh; \
+            WADD(yl, yh, nl[b + k], nh[b + k], sl, sh); \
+            RC_ADD(yl, yh, b + k, RC); \
+            s[b + k] = wred(yl, yh); \
+        } \
+    } \
+}
+#endif
 inline ulong canon(ulong x) { return x >= PRIME ? x - PRIME : x; }
 
 inline void mat4(ulong* x) {
@@ -242,13 +325,27 @@ __kernel void qpow_search(__constant ulong* mid, ulong start, ulong target, __gl
     }
 }
 "#;
-    s.replace("MAX_RESULTS)", &format!("{MAX_RESULTS})")).replace("PERMUTE_BODY", &permute_code())
+    let built = s.replace("MAX_RESULTS)", &format!("{MAX_RESULTS})")).replace("PERMUTE_BODY", &permute_code());
+    // developer hooks for kernel work: MH_QPOW_SAVE writes the built-in source to a file, MH_QPOW_SRC
+    // loads a kernel from a file instead. A loaded kernel is still checked against the CPU before use.
+    if let Ok(path) = std::env::var("MH_QPOW_SAVE") {
+        let _ = std::fs::write(&path, &built);
+    }
+    if let Ok(path) = std::env::var("MH_QPOW_SRC") {
+        if let Ok(src) = std::fs::read_to_string(&path) {
+            return src;
+        }
+    }
+    built
 }
 
 /// Kernel variants, fastest first. Each is proven against the CPU on the actual card before
 /// it is used; the last one is the exact, portable code that every OpenCL device can run.
 pub const VARIANTS: &[(&str, &str)] = &[
-    // carry-flag reduction, addition, multiply-add and sums: 205 MH/s on an RTX 5060 Ti (exact code: 145)
+    // carry-flag code plus lazy external layers, three-product squaring and a 128-register cap:
+    // 240 MH/s on an RTX 5060 Ti (carry-flag alone: 221)
+    ("NVIDIA lazy", "-DRED_PTX -DADD_PTX -DMULADD_PTX -DSUM_PTX -DLAZY -DSQR3 -cl-nv-maxrregcount=128"),
+    // carry-flag reduction, addition, multiply-add and sums: 221 MH/s on an RTX 5060 Ti (exact code: 145)
     ("NVIDIA carry-flag", "-DRED_PTX -DADD_PTX -DMULADD_PTX -DSUM_PTX"),
     ("exact", ""),
 ];
@@ -271,8 +368,13 @@ fn e<T: std::fmt::Display>(x: T) -> String {
 impl QpowGpu {
     /// Open the GPU with the fastest kernel variant that gives correct results on it.
     pub fn open_checked(info: &GpuInfo) -> Result<QpowGpu, String> {
-        if let Ok(defs) = std::env::var("MH_QPOW_DEFS") {
-            let defs: &'static str = Box::leak(defs.into_boxed_str());
+        if std::env::var("MH_QPOW_DEFS").is_ok() || std::env::var("MH_QPOW_SRC").is_ok() || std::env::var("MH_QPOW_PTX").is_ok() {
+            let defs: &'static str = Box::leak(std::env::var("MH_QPOW_DEFS").unwrap_or_default().into_boxed_str());
+            let mut g = QpowGpu::open_with(info, 4096, "custom", defs)?;
+            if !g.self_check(4096) {
+                return Err("custom QPoW kernel gives wrong hashes (checked against the CPU)".into());
+            }
+            eprintln!("custom QPoW kernel: 4096 hashes match the CPU");
             return QpowGpu::open_with(info, 0, "custom", defs);
         }
         for (name, defs) in VARIANTS {
@@ -326,7 +428,15 @@ impl QpowGpu {
         let queue = CommandQueue::create_default(&context, 0).map_err(e)?;
         let (_, per) = tune();
         let opts = format!("-DPER_THREAD={per}{} {defs}", if debug_threads > 0 { " -DDEBUG_OUT" } else { "" });
-        let program = Program::create_and_build_from_source(&context, &source(), &opts).map_err(|l| format!("QPoW kernel: {l}"))?;
+        // developer hook: load ready-made PTX (MH_QPOW_PTX, and MH_QPOW_PTX_DEBUG for the self-check build)
+        let ptx_var = if debug_threads > 0 { "MH_QPOW_PTX_DEBUG" } else { "MH_QPOW_PTX" };
+        let program = match std::env::var(ptx_var).ok().and_then(|p| std::fs::read(p).ok()) {
+            Some(mut ptx) => {
+                ptx.push(0);
+                Program::create_and_build_from_binary(&context, &[&ptx], "").map_err(|l| format!("QPoW PTX: {l}"))?
+            }
+            None => Program::create_and_build_from_source(&context, &source(), &opts).map_err(|l| format!("QPoW kernel: {l}"))?,
+        };
         if let Ok(path) = std::env::var("MH_QPOW_DUMP") {
             if let Ok(bins) = program.get_binaries() {
                 if let Some(b) = bins.first() {
