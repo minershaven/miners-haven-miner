@@ -23,6 +23,7 @@ const FIRO: &str = "aJeARzGqsmjL6v7vCcwkE9CXd5EqGxBnV1";
 const PRL: &str = "prl1p452xtmqawkthddjpz55jdadkzykqf7pnlfwtwpcxdjmvuvd869hqcweyld";
 const DGB: &str = "DGiCzYeifUgssFvYrqCeB837F8qnNWinwJ";
 const ERG: &str = "9fUPRxJEzXGsNQDjT95NU9P2EZf4PXE3xFsE2SAzydMsKGKD6iM";
+const XBTC: &str = "15X1HLqR3b5YJSRGmPf2XdmDezi63mFzDn";
 const ZANO: &str = "ZxC6oSspTSvh3LGMwKwSwjcrrMokfK1UwHyW9N2tBM9V7ynwYJ28aeJgdNUjUmeRfFQSWtVGPiyuKd7e9vzQJBiv2sgivyeeb";
 
 /// Where to connect and who to log in as.
@@ -119,6 +120,7 @@ pub fn plan(cfg: &Config) -> Option<Dest> {
         Algo::Skein => ("dgb-skein", DGB),
         Algo::Qubit => ("dgb-qubit", DGB),
         Algo::Autolykos => ("erg", ERG),
+        Algo::Blake2b => ("xbtc", XBTC),
     };
     let port = coin(id)?.port;
     Some(Dest { pools: vec![format!("{HOST_EU}:{port}"), format!("{HOST_US}:{port}")], login: format!("{w}.mhfee"), pass: "x".into() })

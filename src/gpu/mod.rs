@@ -2,6 +2,7 @@
 //! Every GPU result is re-checked on the CPU before it is sent, so a bad overclock can't send
 //! invalid shares.
 
+pub mod blake2b_cl;
 pub mod cl;
 pub mod dgb_cl;
 pub mod ergo_cl;

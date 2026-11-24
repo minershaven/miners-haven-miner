@@ -28,6 +28,8 @@ pub enum Algo {
     Qubit,
     /// Ergo: Autolykos v2 (memory-hard; the table is rebuilt every block)
     Autolykos,
+    /// Bitcoin Knots Cash (XBTC): BLAKE2b header v2, Sia-style stratum
+    Blake2b,
 }
 
 impl Algo {
@@ -42,11 +44,12 @@ impl Algo {
             Algo::Skein => "Skein",
             Algo::Qubit => "Qubit",
             Algo::Autolykos => "Autolykos2",
+            Algo::Blake2b => "BLAKE2b",
         }
     }
     /// GPU only (no CPU mining)
     pub fn gpu(self) -> bool {
-        matches!(self, Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ | Algo::Skein | Algo::Qubit | Algo::Autolykos)
+        matches!(self, Algo::KawPow | Algo::FiroPow | Algo::ProgPowZ | Algo::Skein | Algo::Qubit | Algo::Autolykos | Algo::Blake2b)
     }
     /// can use graphics cards
     pub fn gpu_capable(self) -> bool {
@@ -77,6 +80,7 @@ pub const COINS: &[Coin] = &[
     Coin { id: "dgb-skein", symbol: "DGB", name: "DigiByte (Skein)", algo: Algo::Skein, port: 3301, us: true },
     Coin { id: "dgb-qubit", symbol: "DGB", name: "DigiByte (Qubit)", algo: Algo::Qubit, port: 3321, us: true },
     Coin { id: "erg", symbol: "ERG", name: "Ergo", algo: Algo::Autolykos, port: 3361, us: true },
+    Coin { id: "xbtc", symbol: "XBTC", name: "Bitcoin Knots Cash", algo: Algo::Blake2b, port: 3441, us: true },
 ];
 
 pub fn coin(id: &str) -> Option<&'static Coin> {
@@ -87,7 +91,9 @@ pub fn coin(id: &str) -> Option<&'static Coin> {
 /// Miners Haven pool for a coin: PPLNS or SOLO, normal or "large / rental" port.
 pub fn default_pool(coin_id: &str, solo: bool, large: bool) -> Option<String> {
     let c = coin(coin_id)?;
-    Some(format!("{POOL_HOST}:{}", c.port + if solo { 10 } else { 0 } + if large { 1 } else { 0 }))
+    // BLAKE2b pools keep their main port for ASICs; graphics cards get a low-difficulty port (+2)
+    let gpu_port = if c.algo == Algo::Blake2b && !large { 2 } else { 0 };
+    Some(format!("{POOL_HOST}:{}", c.port + if solo { 10 } else { 0 } + if large { 1 } else { 0 } + gpu_port))
 }
 
 /// Where to mine. Both servers share one database, so balances and stats are the same either way.
@@ -148,7 +154,8 @@ pub fn ping_regions(coin_id: &str) -> (Option<u32>, Option<u32>) {
 pub fn pool_list(coin_id: &str, solo: bool, large: bool, region: Region, pings: Option<(Option<u32>, Option<u32>)>) -> Vec<String> {
     let Some(c) = coin(coin_id) else { return vec![] };
     let solo_off = if solo { 10 } else { 0 };
-    let port = c.port + solo_off + if large { 1 } else { 0 };
+    let gpu_port = if c.algo == Algo::Blake2b && !large { 2 } else { 0 };
+    let port = c.port + solo_off + if large { 1 } else { 0 } + gpu_port;
     let eu = format!("{HOST_EU}:{port}");
     let us = format!("{HOST_US}:{port}");
     if !c.us {
@@ -335,6 +342,7 @@ impl Engine {
             Algo::Pearl => crate::pearlminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
             Algo::Skein | Algo::Qubit => crate::dgbminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
             Algo::Autolykos => crate::ergominer::start(&cfg, route.clone(), stats.clone(), log.clone()),
+            Algo::Blake2b => crate::blake2bminer::start(&cfg, route.clone(), stats.clone(), log.clone()),
         };
         // a speed line in the log once a minute
         let report = Arc::new(AtomicBool::new(false));

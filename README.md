@@ -21,6 +21,7 @@ Windows desktop app plus the `mhminer` command line for Windows and Linux.
 | DigiByte (DGB) | Skein | GPU |
 | DigiByte (DGB) | Qubit | GPU |
 | Ergo (ERG) | Autolykos2 | GPU with 8 GB or more |
+| Bitcoin Knots Cash (XBTC) | BLAKE2b | GPU (low-difficulty GPU port; BLAKE2b ASICs use the pool directly) |
 
 GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
 
@@ -48,11 +49,12 @@ mhminer --coin prl --bench 20        # Pearl speed test, NVIDIA RTX
 mhminer --coin dgb-skein --wallet YOUR_DGB_ADDRESS --worker rig1
 mhminer --coin qrl --bench 20        # CPU speed test
 mhminer --coin erg --bench 20        # Ergo speed test (builds the table first)
+mhminer --coin xbtc --wallet YOUR_XBTC_ADDRESS --worker rig1
 ```
 
 | Option | Meaning |
 | --- | --- |
-| `--coin X` | qrl, qtc, abrs, firo, zano, prl, dgb-skein, dgb-qubit, erg |
+| `--coin X` | qrl, qtc, abrs, firo, zano, prl, dgb-skein, dgb-qubit, erg, xbtc |
 | `--solo` | mine SOLO instead of PPLNS |
 | `--region X` | auto, us or eu (default auto) |
 | `--large` | high-difficulty port for big rigs and rentals |

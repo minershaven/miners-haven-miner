@@ -8,7 +8,7 @@ use std::sync::Arc;
 #[derive(Parser, Debug)]
 #[command(name = "mhminer", version, about = "Miners Haven Miner - RandomX CPU miner for theminershaven.org")]
 struct Args {
-    /// Coin to mine: qrl, qtc, abrs, firo, zano, prl, dgb-skein, dgb-qubit or erg. Picks the Miners Haven pool and port for you.
+    /// Coin to mine: qrl, qtc, abrs, firo, zano, prl, dgb-skein, dgb-qubit, erg or xbtc. Picks the Miners Haven pool and port for you.
     /// With --pool, any coin of the same algorithm works (e.g. qrl for Monero, abrs for Ravencoin).
     #[arg(long, default_value = "qrl")]
     coin: String,
@@ -149,6 +149,10 @@ fn main() {
                 }
                 let rate = mhminer::ergominer::bench(&args.gpus, secs, log);
                 println!(" benchmark Autolykos2: {}", hr(rate));
+            }
+            engine::Algo::Blake2b => {
+                let rate = mhminer::blake2bminer::bench(&args.gpus, secs, log);
+                println!(" benchmark BLAKE2b: {}", hr(rate));
             }
             a @ (engine::Algo::Skein | engine::Algo::Qubit) => {
                 let rate = mhminer::dgbminer::bench(a, &args.gpus, secs, log);
