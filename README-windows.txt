@@ -1,4 +1,4 @@
-Miners Haven Miner 2.8  -  theminershaven.org
+Miners Haven Miner 2.9  -  theminershaven.org
 =============================================
 
 COINS
@@ -7,6 +7,7 @@ COINS
   On your graphics card (GPU): ERG (Ergo, Autolykos2) - needs 8 GB of graphics memory or more
   On GPU and/or CPU:           QTC (QPoW)
   On your graphics card (GPU): DGB (DigiByte Skein or Qubit)
+  On your graphics card (GPU): XBTC (Bitcoin Knots Cash, BLAKE2b) - uses the pool's GPU port
   On an NVIDIA RTX card:       PRL (Pearl) - RTX 30 series or newer; much slower on a CPU
   GPU coins need the normal NVIDIA or AMD graphics driver (it includes OpenCL).
 
